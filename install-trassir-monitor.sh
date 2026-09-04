@@ -525,7 +525,16 @@ def init_db():
             FOREIGN KEY (server_id) REFERENCES servers (id)
         )
     """)
-    
+
+    # Миграция: колонка resolved_at (момент закрытия алерта — авто или
+    # вручную). Без неё время простоя в уведомлениях о восстановлении
+    # нечем считать (единственная альтернатива — время СОЗДАНИЯ алерта,
+    # что и было ошибкой раньше). ALTER TABLE ADD COLUMN не поддерживает
+    # IF NOT EXISTS в старых SQLite — проверяем через PRAGMA.
+    existing_cols = {row["name"] for row in cursor.execute("PRAGMA table_info(alerts)").fetchall()}
+    if "resolved_at" not in existing_cols:
+        cursor.execute("ALTER TABLE alerts ADD COLUMN resolved_at DATETIME")
+
     # ============================================
     # Таблица settings — настройки системы
     # ============================================
@@ -878,7 +887,16 @@ def collect():
                     health["rt"]
                 ))
                 conn.commit()  # ← ВАЖНО! Сохраняем health сразу
-                
+
+                # ============================================
+                # ВОССТАНОВЛЕНИЕ СЕРВЕРА (был недоступен — теперь ответил)
+                # ============================================
+                conn.execute("""
+                    UPDATE alerts SET ack = 1, resolved_at = datetime('now', '+3 hours')
+                    WHERE server_id = ? AND msg LIKE 'Сервер недоступен:%' AND ack = 0
+                """, (server_id,))
+                conn.commit()
+
                 # Инициализируем channels_info
                 channels_info = None
                 offline_names = []
@@ -915,15 +933,18 @@ def collect():
                         cam_name = alert["msg"].replace("Камера офлайн: ", "").strip()
                         # Если камера теперь онлайн — закрываем алерт
                         if all_channels.get(cam_name, False):
-                            conn.execute("UPDATE alerts SET ack = 1 WHERE id = ?", (alert["id"],))
+                            conn.execute(
+                                "UPDATE alerts SET ack = 1, resolved_at = datetime('now', '+3 hours') WHERE id = ?",
+                                (alert["id"],)
+                            )
                             conn.commit()
                             print(f"  ✅ {server_name}: камера восстановлена: {cam_name}")
                 elif health["ch_o"] == health["ch_t"]:
                     # Все камеры онлайн по health — закрываем все камерные алерты
-                    conn.execute(
-                        "UPDATE alerts SET ack = 1 WHERE server_id = ? AND msg LIKE 'Камера офлайн:%' AND ack = 0",
-                        (server_id,)
-                    )
+                    conn.execute("""
+                        UPDATE alerts SET ack = 1, resolved_at = datetime('now', '+3 hours')
+                        WHERE server_id = ? AND msg LIKE 'Камера офлайн:%' AND ack = 0
+                    """, (server_id,))
                     conn.commit()
 
                 # ============================================
@@ -951,38 +972,52 @@ def collect():
                 if health["disks"] == 0:
                     alerts_list.append(("critical", "Ошибка дисков"))
 
+                # CPU и архив — сначала критический порог (он строже),
+                # иначе критическая нагрузка никогда не будет замечена
+                # отдельно от обычного предупреждения.
                 cpu_warning = float(settings.get("cpu_warning", 80))
-                if health["cpu"] >= cpu_warning:
+                cpu_critical = float(settings.get("cpu_critical", 95))
+                if health["cpu"] >= cpu_critical:
+                    alerts_list.append(("critical", f"CPU: {health['cpu']:.1f}%"))
+                elif health["cpu"] >= cpu_warning:
                     alerts_list.append(("warning", f"CPU: {health['cpu']:.1f}%"))
 
+                # Архив измеряется в днях ДО конца, поэтому "критично" —
+                # это МЕНЬШЕЕ число дней, чем "предупреждение".
                 arch_warning = float(settings.get("archive_warning_days", 14))
-                if health["arch"] <= arch_warning:
+                arch_critical = float(settings.get("archive_critical_days", 7))
+                if health["arch"] <= arch_critical:
+                    alerts_list.append(("critical", f"Архив: {health['arch']:.1f} дн"))
+                elif health["arch"] <= arch_warning:
                     alerts_list.append(("warning", f"Архив: {health['arch']:.1f} дн"))
-                
+
                 # ============================================
                 # АВТОЗАКРЫТИЕ CPU, АРХИВА, ДИСКОВ
                 # ============================================
                 active_types = {msg.split(":")[0].split("(")[0].strip() for _, msg in alerts_list}
 
                 if "CPU" not in active_types:
-                    conn.execute("UPDATE alerts SET ack = 1 WHERE server_id = ? AND msg LIKE 'CPU:%' AND ack = 0", (server_id,))
+                    conn.execute("UPDATE alerts SET ack = 1, resolved_at = datetime('now', '+3 hours') WHERE server_id = ? AND msg LIKE 'CPU:%' AND ack = 0", (server_id,))
                 if "Ошибка дисков" not in active_types:
-                    conn.execute("UPDATE alerts SET ack = 1 WHERE server_id = ? AND msg = 'Ошибка дисков' AND ack = 0", (server_id,))
+                    conn.execute("UPDATE alerts SET ack = 1, resolved_at = datetime('now', '+3 hours') WHERE server_id = ? AND msg = 'Ошибка дисков' AND ack = 0", (server_id,))
                 if "Архив" not in active_types:
-                    conn.execute("UPDATE alerts SET ack = 1 WHERE server_id = ? AND msg LIKE 'Архив:%' AND ack = 0", (server_id,))
+                    conn.execute("UPDATE alerts SET ack = 1, resolved_at = datetime('now', '+3 hours') WHERE server_id = ? AND msg LIKE 'Архив:%' AND ack = 0", (server_id,))
                 conn.commit()
                 
                 for level, message in alerts_list:
                     if message.startswith("CPU:"):
                         existing = conn.execute(
-                            "SELECT id, msg FROM alerts WHERE server_id = ? AND msg LIKE 'CPU:%' AND ack = 0",
+                            "SELECT id, msg, level FROM alerts WHERE server_id = ? AND msg LIKE 'CPU:%' AND ack = 0",
                             (server_id,)
                         ).fetchone()
                         if existing:
-                            if existing["msg"] != message:
+                            # Обновляем и текст, и уровень — иначе переход
+                            # warning -> critical (или обратно) остаётся
+                            # незамеченным до следующего ack.
+                            if existing["msg"] != message or existing["level"] != level:
                                 conn.execute(
-                                    "UPDATE alerts SET msg = ? WHERE id = ?",
-                                    (message, existing["id"])
+                                    "UPDATE alerts SET msg = ?, level = ? WHERE id = ?",
+                                    (message, level, existing["id"])
                                 )
                                 conn.commit()
                         else:
@@ -993,14 +1028,14 @@ def collect():
                             conn.commit()
                     elif message.startswith("Архив:"):
                         existing = conn.execute(
-                            "SELECT id, msg FROM alerts WHERE server_id = ? AND msg LIKE 'Архив:%' AND ack = 0",
+                            "SELECT id, msg, level FROM alerts WHERE server_id = ? AND msg LIKE 'Архив:%' AND ack = 0",
                             (server_id,)
                         ).fetchone()
                         if existing:
-                            if existing["msg"] != message:
+                            if existing["msg"] != message or existing["level"] != level:
                                 conn.execute(
-                                    "UPDATE alerts SET msg = ? WHERE id = ?",
-                                    (message, existing["id"])
+                                    "UPDATE alerts SET msg = ?, level = ? WHERE id = ?",
+                                    (message, level, existing["id"])
                                 )
                                 conn.commit()
                         else:
@@ -1044,12 +1079,32 @@ def collect():
                     ).fetchone()["cnt"]
                 })
             else:
+                # ============================================
+                # СЕРВЕР НЕДОСТУПЕН — один алерт на инцидент, без спама
+                # ============================================
+                err_text = health.get("err", "нет ответа")
+                message = f"Сервер недоступен: {err_text}"
+                existing = conn.execute(
+                    "SELECT id FROM alerts WHERE server_id = ? AND msg LIKE 'Сервер недоступен:%' AND ack = 0",
+                    (server_id,)
+                ).fetchone()
+                if not existing:
+                    conn.execute(
+                        "INSERT INTO alerts (server_id, ts, level, msg) VALUES (?, datetime('now', '+3 hours'), 'critical', ?)",
+                        (server_id, message)
+                    )
+                    print(f"  🔴 {server_name}: {message}")
+                conn.commit()
+
                 updates.append({
                     "id": server_id,
                     "name": server_name,
                     "ip": server["ip"],
                     "ok": 0,
-                    "alerts": 0
+                    "alerts": conn.execute(
+                        "SELECT COUNT(*) as cnt FROM alerts WHERE server_id = ? AND ack = 0",
+                        (server_id,)
+                    ).fetchone()["cnt"]
                 })
 
         # Сохраняем в кэш
@@ -1064,7 +1119,33 @@ def collect():
         
     except Exception as e:
         print(f"Ошибка при сборе данных: {e}")
-        
+
+
+def cleanup_old_data():
+    """
+    Удаляет данные старше retention_days (настройка "Хранение данных").
+    Без этой функции таблица health растёт неограниченно — при
+    poll_interval=15с это ~5760 строк/сервер/сутки.
+
+    - health: удаляется вся история старше порога (нужна только для
+      графиков за последние 6ч/24ч/7д).
+    - alerts: удаляются только уже ЗАКРЫТЫЕ (ack=1) алерты — активные
+      проблемы никогда не трогаем, независимо от возраста.
+    """
+    try:
+        conn = get_db()
+        settings = dict(conn.execute("SELECT key, value FROM settings").fetchall())
+        days = int(float(settings.get("retention_days", 30) or 30))
+        if days > 0:
+            cutoff = f"-{days} days"
+            conn.execute("DELETE FROM health WHERE ts < datetime('now', '+3 hours', ?)", (cutoff,))
+            conn.execute("DELETE FROM alerts WHERE ack = 1 AND ts < datetime('now', '+3 hours', ?)", (cutoff,))
+            conn.commit()
+            print(f"Очистка старых данных: удалены записи старше {days} дн.")
+        conn.close()
+    except Exception as e:
+        print(f"Ошибка очистки старых данных: {e}")
+
 # ============================================
 # ПЛАНИРОВЩИК
 # ============================================
@@ -1078,17 +1159,19 @@ def scheduler():
     conn = get_db()
     settings = dict(conn.execute("SELECT key, value FROM settings").fetchall())
     conn.close()
-    
+
     interval = int(settings.get("poll_interval", 15))
     print(f"Планировщик запущен, интервал: {interval} секунд")
-    
+
     # Настраиваем периодический запуск
     schedule.every(interval).seconds.do(collect)
-    
+    schedule.every(1).hours.do(cleanup_old_data)
+
     # Первый сбор через 5 секунд после старта
     time.sleep(5)
     collect()
-    
+    cleanup_old_data()
+
     # Бесконечный цикл
     while True:
         schedule.run_pending()
@@ -1527,7 +1610,7 @@ def acknowledge_alerts(server_id):
 
     conn = get_db()
     conn.execute(
-        "UPDATE alerts SET ack = 1 WHERE server_id = ? AND ack = 0",
+        "UPDATE alerts SET ack = 1, resolved_at = datetime('now', '+3 hours') WHERE server_id = ? AND ack = 0",
         (server_id,)
     )
     conn.commit()

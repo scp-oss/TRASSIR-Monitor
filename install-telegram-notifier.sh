@@ -714,87 +714,29 @@ def calc_downtime_for_alert(conn, alert):
     """
     Вычисляет время простоя для алерта о восстановлении.
 
-    Алгоритм:
-      1. Если в сообщении есть имя канала (#N Имя) — ищем последний
-         алерт об отвале ИМЕННО этого канала до момента восстановления.
-      2. Если восстановление сервера — ищем алерт "сервер недоступен"
-         или событие offline для этого server_id.
-      3. Возвращает отформатированную строку или '' если не найдено.
-    """
-    msg = alert['msg']
-    server_id = alert['server_id']
-    recovery_ts_str = alert['ts']
+    Раньше здесь был поиск "похожего" более раннего алерта по тексту —
+    ошибочный подход: alert['ts'] это время СОЗДАНИЯ алерта (начало
+    проблемы), а не момент восстановления, и в БД никогда не хранилось,
+    когда именно проблема закрылась (ack=1). На практике это почти
+    всегда возвращало '' или считало интервал между двумя НЕСВЯЗАННЫМИ
+    инцидентами.
 
+    Теперь app.py при каждом закрытии алерта (автоматическом или
+    вручную) пишет resolved_at в ту же строку — простой = разница
+    между resolved_at и ts ОДНОЙ И ТОЙ ЖЕ строки, без поиска.
+    """
+    resolved_at = alert.get('resolved_at')
+    if not resolved_at:
+        return ''
     try:
-        recovery_dt = datetime.strptime(recovery_ts_str, '%Y-%m-%d %H:%M:%S')
+        start_dt = datetime.strptime(alert['ts'], '%Y-%m-%d %H:%M:%S')
+        end_dt = datetime.strptime(resolved_at, '%Y-%m-%d %H:%M:%S')
+        delta = int((end_dt - start_dt).total_seconds())
+        if delta < 0:
+            return ''
+        return format_downtime(delta)
     except Exception:
         return ''
-
-    # --- Попытка 1: восстановление канала (камеры) ---
-    channel_match = re.search(r'#\d+\s+[^\,\]\n]+', msg)
-    if channel_match:
-        channel_name = channel_match.group(0).strip()
-        try:
-            offline_row = conn.execute(
-                """SELECT ts FROM alerts
-                   WHERE server_id = ?
-                     AND msg LIKE 'Камера офлайн:%' || ?
-                     AND ts < ?
-                   ORDER BY ts DESC LIMIT 1""",
-                (server_id, channel_name, recovery_ts_str)
-            ).fetchone()
-            if offline_row:
-                offline_dt = datetime.strptime(offline_row['ts'], '%Y-%m-%d %H:%M:%S')
-                delta = int((recovery_dt - offline_dt).total_seconds())
-                return format_downtime(delta)
-        except Exception:
-            pass
-
-    # --- Попытка 2: восстановление сервера ---
-    msg_lower = msg.lower()
-    if 'сервер' in msg_lower or 'server' in msg_lower:
-        try:
-            offline_row = conn.execute(
-                """SELECT ts FROM alerts
-                   WHERE server_id = ?
-                     AND (
-                           msg LIKE '%недоступ%'
-                        OR msg LIKE '%offline%'
-                        OR msg LIKE '%не отвечает%'
-                        OR msg LIKE '%потеря связи%'
-                        OR level = 'critical'
-                     )
-                     AND ts < ?
-                   ORDER BY ts DESC LIMIT 1""",
-                (server_id, recovery_ts_str)
-            ).fetchone()
-            if offline_row:
-                offline_dt = datetime.strptime(offline_row['ts'], '%Y-%m-%d %H:%M:%S')
-                delta = int((recovery_dt - offline_dt).total_seconds())
-                return format_downtime(delta)
-        except Exception:
-            pass
-
-    # --- Попытка 3: по таблице health — последний момент когда сервер пропадал ---
-    try:
-        # Ищем момент до recovery когда rt был NULL или очень большой (сервер был недоступен)
-        offline_health = conn.execute(
-            """SELECT ts FROM health
-               WHERE server_id = ?
-                 AND (rt IS NULL OR rt > 9000)
-                 AND ts < ?
-               ORDER BY ts DESC LIMIT 1""",
-            (server_id, recovery_ts_str)
-        ).fetchone()
-        if offline_health:
-            offline_dt = datetime.strptime(offline_health['ts'], '%Y-%m-%d %H:%M:%S')
-            delta = int((recovery_dt - offline_dt).total_seconds())
-            if delta > 0:
-                return format_downtime(delta)
-    except Exception:
-        pass
-
-    return ''
 
 
 def already_sent(conn, alert_id):
@@ -833,7 +775,7 @@ def get_new_alerts():
         # --- Обычные алерты (ack=0, ещё не отправлялись) ---
         alerts_rows = conn.execute(
             """SELECT
-                   a.id, a.server_id, a.level, a.msg, a.ts, a.ack,
+                   a.id, a.server_id, a.level, a.msg, a.ts, a.ack, a.resolved_at,
                    s.name as server_name, s.ip as server_ip
                FROM alerts a
                JOIN servers s ON a.server_id = s.id
@@ -851,7 +793,7 @@ def get_new_alerts():
         #     и нет записи о восстановлении (alert_key = 'recovery_' + id) ---
         recovery_rows = conn.execute(
             """SELECT
-                   a.id, a.server_id, a.level, a.msg, a.ts, a.ack,
+                   a.id, a.server_id, a.level, a.msg, a.ts, a.ack, a.resolved_at,
                    s.name as server_name, s.ip as server_ip
                FROM alerts a
                JOIN servers s ON a.server_id = s.id
@@ -886,6 +828,8 @@ def get_new_alerts():
             if 'Камера офлайн:' in orig:
                 cam_name = orig.replace('Камера офлайн: ', '').strip()
                 d['recovery_msg'] = f"✅ Камера восстановлена: {cam_name}"
+            elif 'Сервер недоступен' in orig:
+                d['recovery_msg'] = "✅ Сервер восстановлен"
             elif 'CPU' in orig:
                 d['recovery_msg'] = f"✅ CPU в норме (было: {orig})"
             elif 'Архив' in orig:
