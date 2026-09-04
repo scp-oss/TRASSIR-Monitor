@@ -52,7 +52,7 @@
 ### 1. Основной монитор
 
 ```bash
-wget https://raw.githubusercontent.com/naumenis-code/TRASSIR-Monitor/main/install-trassir-monitor.sh
+wget https://raw.githubusercontent.com/scp-oss/TRASSIR-Monitor/main/install-trassir-monitor.sh
 bash install-trassir-monitor.sh
 ```
 
@@ -67,7 +67,7 @@ bash install-trassir-monitor.sh
 ### 2. Telegram-уведомления *(опционально)*
 
 ```bash
-wget https://raw.githubusercontent.com/naumenis-code/TRASSIR-Monitor/main/install-telegram-notifier.sh
+wget https://raw.githubusercontent.com/scp-oss/TRASSIR-Monitor/main/install-telegram-notifier.sh
 bash install-telegram-notifier.sh
 ```
 
@@ -81,7 +81,7 @@ bash install-telegram-notifier.sh
 ### 3. Email-уведомления *(опционально)* `v1.3`
 
 ```bash
-wget https://raw.githubusercontent.com/naumenis-code/TRASSIR-Monitor/main/install-mail-notifier.sh
+wget https://raw.githubusercontent.com/scp-oss/TRASSIR-Monitor/main/install-mail-notifier.sh
 bash install-mail-notifier.sh
 ```
 
@@ -239,6 +239,6 @@ sudo trassir-monitor-uninstall
 <div align="center">
 
 **Сделано для администраторов систем видеонаблюдения TRASSIR**  
-Вопросы и предложения — через [Issues](https://github.com/naumenis-code/TRASSIR-Monitor/issues)
+Вопросы и предложения — через [Issues](https://github.com/scp-oss/TRASSIR-Monitor/issues)
 
 </div>
