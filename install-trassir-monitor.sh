@@ -2660,10 +2660,15 @@ cat > $INSTALL_DIR/templates/dashboard.html << 'DASHEOF'
             <div class="text-center py-5">
                 <i class="bi bi-inbox" style="font-size: 4rem; color: var(--muted);"></i>
                 <h4 class="mt-3" style="color: var(--muted);">Нет добавленных серверов</h4>
+                {% if logged_in %}
                 <p style="color: var(--muted);">Добавьте сервер TRASSIR для начала мониторинга</p>
                 <button class="btn btn-primary btn-lg mt-3" data-bs-toggle="modal" data-bs-target="#addModal">
                     <i class="bi bi-plus-lg"></i> Добавить сервер
                 </button>
+                {% else %}
+                <p style="color: var(--muted);">Для добавления сервера необходимо
+                    <a href="/login">войти</a>.</p>
+                {% endif %}
             </div>
         {% endif %}
     </div>
@@ -2681,6 +2686,7 @@ cat > $INSTALL_DIR/templates/dashboard.html << 'DASHEOF'
 </button>
 {% endif %}
 
+{% if logged_in %}
 <!-- ============================================ -->
 <!-- МОДАЛЬНОЕ ОКНО: ДОБАВЛЕНИЕ СЕРВЕРА            -->
 <!-- ============================================ -->
@@ -2807,6 +2813,7 @@ cat > $INSTALL_DIR/templates/dashboard.html << 'DASHEOF'
         </div>
     </div>
 </div>
+{% endif %}
 
 {% endblock %}
 
