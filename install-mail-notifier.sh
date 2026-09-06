@@ -392,6 +392,7 @@ import sqlite3
 import smtplib
 import ssl
 import traceback
+import html as html_escape_mod
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime
@@ -843,6 +844,19 @@ def format_alert_email(alert_data, settings):
     monitor_url = settings.get('monitor_url', '')
     downtime = alert_data.get('downtime', '')
 
+    # Название/IP сервера и текст события заполняются человеком (форма
+    # добавления сервера) или самим устройством TRASSIR (имя канала) --
+    # без экранирования это HTML-инъекция в письмо, которое реально
+    # рендерится почтовым клиентом получателя. subject_safe_name -- отдельно,
+    # только без переноса строк (защита от header injection в Subject),
+    # HTML-экранирование там не нужно и испортило бы читаемость темы письма.
+    subject_safe_name = str(server_name).replace('\r', ' ').replace('\n', ' ')
+    server_name = html_escape_mod.escape(str(server_name))
+    server_ip = html_escape_mod.escape(str(server_ip))
+    message = html_escape_mod.escape(str(message))
+    if monitor_url:
+        monitor_url = html_escape_mod.escape(monitor_url)
+
     cpu_val = health.get('cpu', '?')
     cpu_str = f"{cpu_val:.1f}%" if isinstance(cpu_val, (int, float)) else f"{cpu_val}%"
     arch_val = health.get('arch', '?')
@@ -878,7 +892,7 @@ def format_alert_email(alert_data, settings):
                 </td>
               </tr>"""
 
-    subject = f"{style['subject_prefix']} \u2014 {server_name}"
+    subject = f"{style['subject_prefix']} \u2014 {subject_safe_name}"
 
     html = f"""<!DOCTYPE html>
 <html>
@@ -1040,6 +1054,7 @@ def format_alert_email(alert_data, settings):
 def format_test_email(settings):
     """Формирует тестовое HTML-письмо"""
     monitor_url = settings.get('monitor_url', '\u043d\u0435 \u0443\u043a\u0430\u0437\u0430\u043d')
+    monitor_url = html_escape_mod.escape(monitor_url) if monitor_url else monitor_url
     ts = datetime.now().strftime("%d.%m.%Y %H:%M:%S МСК")
 
     subject = f"{EMOJI_OK} TRASSIR Monitor \u2014 Email \u0443\u0432\u0435\u0434\u043e\u043c\u043b\u0435\u043d\u0438\u044f \u043d\u0430\u0441\u0442\u0440\u043e\u0435\u043d\u044b"

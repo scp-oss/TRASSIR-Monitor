@@ -420,6 +420,7 @@ import sqlite3
 import requests
 import configparser
 import traceback
+import html
 from datetime import datetime, timedelta
 
 # ============================================
@@ -640,10 +641,23 @@ def format_alert_message(alert_data):
     if is_recovery and alert_data.get('recovery_msg'):
         message = alert_data['recovery_msg']
 
+    # classify_alert смотрит на текст ДО экранирования — она ищет
+    # ключевые русские слова, а не HTML-разметку, порядок не важен.
     kind, header, _ = classify_alert(level, message)
     if is_recovery:
         kind, header = 'OK', 'ВОССТАНОВЛЕНИЕ'
     emoji = EMOJI_REAL.get(kind, '\u2757')
+
+    # Telegram \u043e\u0442\u043f\u0440\u0430\u0432\u043b\u044f\u0435\u0442\u0441\u044f \u0441 parse_mode=HTML \u2014 \u043b\u044e\u0431\u043e\u0439 '<'/'>'/'&' \u0432 \u0438\u043c\u0435\u043d\u0438
+    # \u0441\u0435\u0440\u0432\u0435\u0440\u0430, \u043a\u0430\u043c\u0435\u0440\u044b \u0438\u043b\u0438 \u0432 \u0442\u0435\u043a\u0441\u0442\u0435 \u0441\u043e\u0431\u044b\u0442\u0438\u044f (\u0432\u0441\u0451 \u044d\u0442\u043e \u0437\u0430\u043f\u043e\u043b\u043d\u044f\u0435\u0442 \u0447\u0435\u043b\u043e\u0432\u0435\u043a \u0438\u043b\u0438
+    # \u0441\u0430\u043c\u043e \u0443\u0441\u0442\u0440\u043e\u0439\u0441\u0442\u0432\u043e TRASSIR, \u043d\u0435 \u043c\u044b) \u0434\u0435\u043b\u0430\u0435\u0442 \u0440\u0430\u0437\u043c\u0435\u0442\u043a\u0443 \u043d\u0435\u0432\u0430\u043b\u0438\u0434\u043d\u043e\u0439. \u0411\u0435\u0437
+    # \u044d\u043a\u0440\u0430\u043d\u0438\u0440\u043e\u0432\u0430\u043d\u0438\u044f Telegram \u043e\u0442\u0432\u0435\u0447\u0430\u0435\u0442 400 "can't parse entities" \u0438
+    # send_telegram_message() \u0442\u0438\u0445\u043e \u0432\u043e\u0437\u0432\u0440\u0430\u0449\u0430\u0435\u0442 False \u2014 \u0441\u043e\u043e\u0431\u0449\u0435\u043d\u0438\u0435 \u043d\u0435 \u043f\u0440\u043e\u0441\u0442\u043e
+    # \u0432\u044b\u0433\u043b\u044f\u0434\u0438\u0442 \u043d\u0435\u043a\u0440\u0430\u0441\u0438\u0432\u043e, \u043e\u043d\u043e \u0432\u043e\u043e\u0431\u0449\u0435 \u043d\u0435 \u0443\u0445\u043e\u0434\u0438\u0442, silently, \u0434\u043b\u044f \u043b\u044e\u0431\u043e\u0433\u043e
+    # \u0441\u0435\u0440\u0432\u0435\u0440\u0430/\u043a\u0430\u043c\u0435\u0440\u044b \u0441 \u0442\u0430\u043a\u0438\u043c \u0438\u043c\u0435\u043d\u0435\u043c.
+    server_name = html.escape(str(server_name))
+    server_ip = html.escape(str(server_ip))
+    message = html.escape(str(message))
 
     cfg = get_config()
     monitor_url = cfg.get('monitor_url', '') if cfg else ''
@@ -679,7 +693,7 @@ def format_alert_message(alert_data):
     ]
 
     if monitor_url and server_id:
-        lines.append(f"\n{ICON_LINK} <a href='{monitor_url}/server/{server_id}'>Открыть в TRASSIR Monitor</a>")
+        lines.append(f"\n{ICON_LINK} <a href='{html.escape(monitor_url)}/server/{server_id}'>Открыть в TRASSIR Monitor</a>")
 
     return "\n".join(lines)
 
@@ -687,6 +701,7 @@ def format_alert_message(alert_data):
 def format_test_message(monitor_url=""):
     """Форматирует тестовое сообщение."""
     ts = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
+    monitor_url = html.escape(monitor_url) if monitor_url else ""
     return (
         f"\u2705 <b>TRASSIR Monitor \u2014 Бот установлен!</b>\n\n"
         f"\U0001f5a5 <b>Система мониторинга активна</b>\n"

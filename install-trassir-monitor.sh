@@ -358,6 +358,17 @@ def _load_or_create_secret_key():
 # Секретный ключ для сессий и безопасности
 app.secret_key = _load_or_create_secret_key()
 
+# Cookie сессии: HttpOnly (по умолчанию и так True, ставим явно, чтобы не
+# зависеть от версии Flask) — JS не может прочитать cookie даже через XSS.
+# SameSite=Lax — браузер не приложит cookie к межсайтовому запросу (кроме
+# перехода по ссылке), то есть CSRF через чужую страницу, отправляющую
+# fetch()/form на наш /api/..., не сработает без валидной сессии этого же
+# сайта. Secure не включаем — README прямо поддерживает работу без SSL
+# (локальная сеть без сертификата), а Secure-cookie браузер не отправит
+# по обычному http.
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+
 # Включаем поддержку Cross-Origin Resource Sharing
 CORS(app)
 
@@ -2479,11 +2490,22 @@ cat > $INSTALL_DIR/templates/base.html << 'BASEEOF'
     
     <!-- Скрипты -->
     <script>
+        // Экранирование пользовательских строк перед вставкой через innerHTML —
+        // имя получателя Telegram/Email, SMTP-логин и т.п. приходят из API как
+        // обычные строки и могли бы разорвать HTML/атрибут при вставке как есть
+        // (см. renderTelegram()/renderMail() в settings.html).
+        function escapeHtml(value) {
+            if (value === null || value === undefined) return '';
+            return String(value).replace(/[&<>"']/g, function(c) {
+                return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
+            });
+        }
+
         // Часы в навигации
         setInterval(function() {
             document.getElementById('clock').textContent = new Date().toLocaleString('ru-RU');
         }, 1000);
-        
+
         // WebSocket подключение
         const socket = io();
         
@@ -3041,11 +3063,11 @@ async function testConnection() {
             resultDiv.innerHTML = 
                 '<div class="alert alert-danger">' +
                 '<strong>❌ Ошибка подключения</strong><br>' +
-                (result.error || 'Неизвестная ошибка') +
+                escapeHtml(result.error || 'Неизвестная ошибка') +
                 '</div>';
         }
     } catch (err) {
-        resultDiv.innerHTML = '<div class="alert alert-danger">Ошибка: ' + err.message + '</div>';
+        resultDiv.innerHTML = '<div class="alert alert-danger">Ошибка: ' + escapeHtml(err.message) + '</div>';
     }
 }
 </script>
@@ -3799,7 +3821,7 @@ async function testConnection() {
             resultDiv.innerHTML = '<div class="alert alert-success">✅ Подключение успешно! Камер: ' +
                 (result.data?.channels_online||0) + '/' + (result.data?.channels_total||0) + '</div>';
         } else {
-            resultDiv.innerHTML = '<div class="alert alert-danger">❌ ' + (result.error||'Ошибка') + '</div>';
+            resultDiv.innerHTML = '<div class="alert alert-danger">❌ ' + escapeHtml(result.error||'Ошибка') + '</div>';
         }
     } catch(e) {
         resultDiv.innerHTML = '<div class="alert alert-danger">Ошибка: ' + e.message + '</div>';
@@ -3847,20 +3869,20 @@ async function loadTelegramSection() {
 function renderTelegram(chats, cfg) {
     var html = '';
     if (cfg.token_configured) {
-        html += '<div class="alert alert-success py-2 mb-3">✅ Токен: ' + (cfg.token_masked||'настроен') + '</div>';
+        html += '<div class="alert alert-success py-2 mb-3">✅ Токен: ' + escapeHtml(cfg.token_masked||'настроен') + '</div>';
     } else {
         html += '<div class="alert alert-warning py-2 mb-3">⚠️ Токен не настроен</div>';
     }
     if (cfg.proxy_url) {
-        html += '<div class="mb-2" style="color:var(--muted);font-size:0.85rem;">Прокси: ' + cfg.proxy_url + '</div>';
+        html += '<div class="mb-2" style="color:var(--muted);font-size:0.85rem;">Прокси: ' + escapeHtml(cfg.proxy_url) + '</div>';
     }
     html += '<div class="mb-3"><strong>Получатели:</strong></div>';
     if (chats.length) {
         chats.forEach(function(c) {
             var enabled = c.enabled == 1;
             html += '<div class="d-flex justify-content-between align-items-center mb-2 p-2" style="background:var(--bg);border-radius:8px;opacity:' + (enabled?'1':'0.5') + '">' +
-                '<span>' + (c.name || '<span style="color:var(--muted)">без имени</span>') +
-                ' <small style="color:var(--muted);">(' + c.chat_id + ')</small></span>' +
+                '<span>' + (c.name ? escapeHtml(c.name) : '<span style="color:var(--muted)">без имени</span>') +
+                ' <small style="color:var(--muted);">(' + escapeHtml(c.chat_id) + ')</small></span>' +
                 '<div class="d-flex gap-1">' +
                 '<button class="btn btn-sm ' + (enabled ? 'btn-success' : 'btn-outline-secondary') + '" onclick="toggleTgChat(' + c.id + ',' + (enabled?0:1) + ')" title="' + (enabled?'Выключить':'Включить') + '">' +
                 '<i class="bi bi-' + (enabled?'bell':'bell-slash') + '"></i></button>' +
@@ -3905,8 +3927,8 @@ async function testTelegram() {
     var r = await fetch('/api/telegram/test', {method:'POST'});
     var d = await r.json();
     document.getElementById('tgTestResult').innerHTML = d.ok ?
-        '<small style="color:var(--green);">✅ ' + d.message + '</small>' :
-        '<small style="color:var(--red);">❌ ' + d.error + '</small>';
+        '<small style="color:var(--green);">✅ ' + escapeHtml(d.message) + '</small>' :
+        '<small style="color:var(--red);">❌ ' + escapeHtml(d.error) + '</small>';
 }
 
 async function loadMailSection() {
@@ -3937,9 +3959,9 @@ function renderMail(recipients, cfg) {
 
     // SMTP инфо
     var smtpInfo = smtpOk
-        ? "<b>SMTP:</b> <span style='color:var(--green)'>" + (cfg.smtp_server||"?") + ":" + (cfg.smtp_port||"587") + "</span>" +
-          (cfg.smtp_user ? " | <b>Логин:</b> " + cfg.smtp_user : "") +
-          (cfg.monitor_url ? "<br><b>URL:</b> " + cfg.monitor_url : "")
+        ? "<b>SMTP:</b> <span style='color:var(--green)'>" + escapeHtml(cfg.smtp_server||"?") + ":" + escapeHtml(cfg.smtp_port||"587") + "</span>" +
+          (cfg.smtp_user ? " | <b>Логин:</b> " + escapeHtml(cfg.smtp_user) : "") +
+          (cfg.monitor_url ? "<br><b>URL:</b> " + escapeHtml(cfg.monitor_url) : "")
         : "<span style='color:var(--red)'>❌ SMTP не настроен</span>";
 
     // Список получателей
@@ -3951,8 +3973,8 @@ function renderMail(recipients, cfg) {
                 "opacity:" + (r.enabled ? "1" : "0.5") + "'>" +
                 "<div><span class='badge bg-" + (r.enabled ? "success" : "secondary") + " me-1'>" +
                 (r.enabled ? "вкл" : "выкл") + "</span>" +
-                "<b>" + (r.name || "без имени") + "</b> " +
-                "<code style='font-size:11px'>" + r.email + "</code></div>" +
+                "<b>" + escapeHtml(r.name || "без имени") + "</b> " +
+                "<code style='font-size:11px'>" + escapeHtml(r.email) + "</code></div>" +
                 "<div>" +
                 "<button class='btn btn-sm btn-outline-" + (r.enabled ? "success" : "secondary") + " me-1' " +
                 "onclick='mailToggleRcpt(" + r.id + "," + (r.enabled ? 0 : 1) + ")' title='" + (r.enabled ? "Выключить" : "Включить") + "'>" +
@@ -3977,19 +3999,19 @@ function renderMail(recipients, cfg) {
         "<div class='p-3 rounded' style='background:var(--bg);border:1px solid #2d3239'>" +
         "<div class='row g-2'>" +
         "<div class='col-8'><label class='form-label small'>SMTP сервер</label>" +
-        "<input type='text' class='form-control form-control-sm mfc' id='mailSmtpServer' value='" + (cfg.smtp_server||"") + "' placeholder='smtp.gmail.com'></div>" +
+        "<input type='text' class='form-control form-control-sm mfc' id='mailSmtpServer' value='" + escapeHtml(cfg.smtp_server||"") + "' placeholder='smtp.gmail.com'></div>" +
         "<div class='col-4'><label class='form-label small'>Порт</label>" +
-        "<input type='number' class='form-control form-control-sm mfc' id='mailSmtpPort' value='" + (cfg.smtp_port||"587") + "'></div>" +
+        "<input type='number' class='form-control form-control-sm mfc' id='mailSmtpPort' value='" + escapeHtml(cfg.smtp_port||"587") + "'></div>" +
         "<div class='col-6'><label class='form-label small'>Логин</label>" +
-        "<input type='text' class='form-control form-control-sm mfc' id='mailSmtpUser' value='" + (cfg.smtp_user||"") + "' placeholder='user@domain.com'></div>" +
+        "<input type='text' class='form-control form-control-sm mfc' id='mailSmtpUser' value='" + escapeHtml(cfg.smtp_user||"") + "' placeholder='user@domain.com'></div>" +
         "<div class='col-6'><label class='form-label small'>Пароль</label>" +
         "<input type='password' class='form-control form-control-sm mfc' id='mailSmtpPass' placeholder='••••••••'></div>" +
         "<div class='col-6'><label class='form-label small'>Имя отправителя</label>" +
-        "<input type='text' class='form-control form-control-sm mfc' id='mailFromName' value='" + (cfg.from_name||"TRASSIR Monitor") + "'></div>" +
+        "<input type='text' class='form-control form-control-sm mfc' id='mailFromName' value='" + escapeHtml(cfg.from_name||"TRASSIR Monitor") + "'></div>" +
         "<div class='col-6'><label class='form-label small'>Email отправителя</label>" +
-        "<input type='text' class='form-control form-control-sm mfc' id='mailFromAddr' value='" + (cfg.from_addr||"") + "' placeholder='monitor@domain.com'></div>" +
+        "<input type='text' class='form-control form-control-sm mfc' id='mailFromAddr' value='" + escapeHtml(cfg.from_addr||"") + "' placeholder='monitor@domain.com'></div>" +
         "<div class='col-12'><label class='form-label small'>URL монитора (для ссылок в письмах)</label>" +
-        "<input type='text' class='form-control form-control-sm mfc' id='mailMonitorUrl' value='" + (cfg.monitor_url||"") + "' placeholder='http://192.168.1.100:8080'></div>" +
+        "<input type='text' class='form-control form-control-sm mfc' id='mailMonitorUrl' value='" + escapeHtml(cfg.monitor_url||"") + "' placeholder='http://192.168.1.100:8080'></div>" +
         "<div class='col-12'><button class='btn btn-primary btn-sm w-100' onclick='mailSaveSmtp()'>" +
         "<i class='bi bi-check-lg'></i> Сохранить SMTP</button></div>" +
         "</div><small class='text-muted d-block mt-2'>Gmail: используйте пароль приложения (App Password)</small>" +
@@ -4124,8 +4146,8 @@ async function testMail() {
     var r = await fetch('/api/mail/test', {method:'POST'});
     var d = await r.json();
     document.getElementById('mailTestResult').innerHTML = d.ok ?
-        '<small style="color:var(--green);">✅ ' + d.message + '</small>' :
-        '<small style="color:var(--red);">❌ ' + d.error + '</small>';
+        '<small style="color:var(--green);">✅ ' + escapeHtml(d.message) + '</small>' :
+        '<small style="color:var(--red);">❌ ' + escapeHtml(d.error) + '</small>';
 }
 
 // Загружаем статус служб при открытии страницы
