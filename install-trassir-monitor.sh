@@ -1557,28 +1557,64 @@ def api_health(server_id):
     return jsonify(result)
 
 
+HIST_MAX_POINTS = 60
+
+
+def _aggregate_history(rows):
+    """
+    Схлопывает историю до HIST_MAX_POINTS точек усреднением по чанкам —
+    ровно тот же алгоритм, что раньше выполнялся в браузере
+    (loadHistory() в server.html: шаг = ceil(N/60), метка времени —
+    середина чанка, cpu/arch — среднее, ch_online/ch_total — среднее
+    округлённое). Перенесено на сервер, чтобы не гонять по сети сырые
+    ~40000 строк (7 дней при опросе раз в 15 сек, ~6МБ JSON) ради
+    графика, который всё равно показывает не больше 60 точек — сама
+    картинка не меняется, только объём трафика на её построение.
+    """
+    if len(rows) <= HIST_MAX_POINTS:
+        return rows
+    step = -(-len(rows) // HIST_MAX_POINTS)  # ceil без импорта math
+    aggregated = []
+    for i in range(0, len(rows), step):
+        chunk = rows[i:i + step]
+        mid = chunk[len(chunk) // 2]
+        n = len(chunk)
+        aggregated.append({
+            "ts": mid["ts"],
+            "cpu": sum(r["cpu"] or 0 for r in chunk) / n,
+            "ch_online": round(sum(r["ch_online"] or 0 for r in chunk) / n),
+            "ch_total": round(sum(r["ch_total"] or 0 for r in chunk) / n),
+            "arch": sum(r["arch"] or 0 for r in chunk) / n,
+        })
+    return aggregated
+
+
 @app.route("/api/hist/<int:server_id>")
 def api_history(server_id):
     """
-    API: получить историю здоровья сервера.
-    
+    API: получить историю здоровья сервера для графика.
+
     Параметры:
-        h (опционально): количество часов (по умолчанию 24)
-    
-    Используется для построения графиков.
+        h (опционально): количество часов (по умолчанию 0.5)
+
+    Если сырых точек в выбранном диапазоне больше HIST_MAX_POINTS,
+    возвращается уже агрегированный (усреднённый по чанкам) ряд — см.
+    _aggregate_history(). Иначе — сырые строки как есть, без изменений
+    по сравнению с прежним поведением.
     """
     hours = request.args.get("h", 0.5, type=float)
-    
+
     conn = get_db()
     history = conn.execute("""
-        SELECT * FROM health 
-        WHERE server_id = ? 
+        SELECT * FROM health
+        WHERE server_id = ?
         AND ts > datetime('now', '+3 hours', ?)
         ORDER BY ts
     """, (server_id, f'-{hours} hours')).fetchall()
     conn.close()
-    
-    return jsonify([dict(h) for h in history])
+
+    rows = [dict(h) for h in history]
+    return jsonify(_aggregate_history(rows))
 
 
 @app.route("/api/servers", methods=["GET", "POST", "PUT", "DELETE"])
