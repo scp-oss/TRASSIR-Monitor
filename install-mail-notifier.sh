@@ -685,22 +685,13 @@ def mark_alert_as_sent(alert_id, email, subject):
         conn.close()
 
 
-def cleanup_old_logs():
-    """Удаляет старые записи из mail_logs (старше 7 дней)"""
-    conn = None
-    try:
-        conn = get_db()
-        deleted = conn.execute(
-            "DELETE FROM mail_logs WHERE ts < datetime('now', '-7 days')"
-        ).rowcount
-        conn.commit()
-        if deleted > 0:
-            print(f"[{datetime.now()}] \U0001f9f9 \u041e\u0447\u0438\u0449\u0435\u043d\u043e \u0441\u0442\u0430\u0440\u044b\u0445 \u0437\u0430\u043f\u0438\u0441\u0435\u0439: {deleted}")
-    except Exception as e:
-        print(f"[{datetime.now()}] WARN \u043e\u0447\u0438\u0441\u0442\u043a\u0430: {e}")
-    finally:
-        if conn:
-            conn.close()
+# Очистка mail_logs теперь централизована в app.py::cleanup_old_data()
+# (запускается там же, где чистятся health/alerts, раз в час) — привязана
+# к жизни самого алерта, а не к отдельному фиксированному таймеру. Раньше
+# здесь была своя очистка по 7 дням НЕЗАВИСИМО от retention_days и от
+# того, закрыт ли алерт — если проблема оставалась открытой дольше 7
+# дней, запись об уже отправленном письме удалялась раньше самого
+# алерта, и на следующем опросе бот считал его "новым" и слал повторно.
 
 
 # ============================================
@@ -1166,8 +1157,6 @@ def run_bot():
     else:
         print(f"[{datetime.now()}] WARN SMTP \u043d\u0435 \u043d\u0430\u0441\u0442\u0440\u043e\u0435\u043d")
 
-    cleanup_old_logs()
-
     total_sent = 0
     checks = 0
 
@@ -1223,9 +1212,6 @@ def run_bot():
                         downtime_info = f" | \u043f\u0440\u043e\u0441\u0442\u043e\u0439: {alert['downtime']}" if alert.get('downtime') else ""
                         print(f"[{datetime.now()}] OK \u041e\u0442\u043f\u0440\u0430\u0432\u043b\u0435\u043d\u043e: {alert['msg'][:60]}{downtime_info} -> {email}")
                         time.sleep(0.2)
-
-            if checks % 360 == 0:
-                cleanup_old_logs()
 
         except KeyboardInterrupt:
             print(f"\n[{datetime.now()}] \U0001f6d1 Mail Bot \u043e\u0441\u0442\u0430\u043d\u043e\u0432\u043b\u0435\u043d. \u041e\u0442\u043f\u0440\u0430\u0432\u043b\u0435\u043d\u043e: {total_sent}")

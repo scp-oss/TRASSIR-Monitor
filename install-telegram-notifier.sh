@@ -902,20 +902,13 @@ def is_telegram_enabled():
         conn.close()
 
 
-def cleanup_old_logs():
-    """Удаляет старые записи из telegram_logs (старше 7 дней)."""
-    try:
-        conn = get_database_connection()
-        deleted = conn.execute(
-            "DELETE FROM telegram_logs WHERE ts < datetime('now', '+3 hours', '-7 days')"
-        ).rowcount
-        conn.commit()
-        if deleted > 0:
-            print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] Очищено старых записей: {deleted}")
-    except Exception as e:
-        print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] WARN очистка: {e}")
-    finally:
-        conn.close()
+# Очистка telegram_logs теперь централизована в app.py::cleanup_old_data()
+# (запускается там же, где чистятся health/alerts, раз в час) — привязана
+# к жизни самого алерта, а не к отдельному фиксированному таймеру. Раньше
+# здесь была своя очистка по 7 дням НЕЗАВИСИМО от retention_days и от
+# того, закрыт ли алерт — если проблема оставалась открытой дольше 7
+# дней, запись об уже отправленном уведомлении удалялась раньше самого
+# алерта, и на следующем опросе бот считал его "новым" и слал повторно.
 
 
 # ============================================
@@ -940,8 +933,6 @@ def run_bot():
         print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] Прокси: настроен")
     else:
         print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] Подключение: прямое")
-
-    cleanup_old_logs()
 
     total_sent = 0
     checks = 0
@@ -1004,10 +995,6 @@ def run_bot():
                         downtime_info = f" | простой: {alert['downtime']}" if alert.get('downtime') else ""
                         print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] OK {alert['msg'][:60]}{downtime_info} -> {chat_id}")
                         time.sleep(0.05)
-
-            # Очистка каждые 6 минут (360 итераций)
-            if checks % 360 == 0:
-                cleanup_old_logs()
 
         except KeyboardInterrupt:
             print(f"\n[{datetime.now():%Y-%m-%d %H:%M:%S}] Бот остановлен. Отправлено: {total_sent}")
