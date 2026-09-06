@@ -306,6 +306,7 @@ import time
 import re
 import secrets
 import hmac
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from flask import Flask, jsonify, render_template, request, session, redirect, url_for
 from flask_cors import CORS
@@ -830,6 +831,43 @@ class TrassirClient:
 # СБОР ДАННЫХ СО ВСЕХ СЕРВЕРОВ
 # ============================================
 
+def _fetch_server_data(server, servers_with_open_cam_alerts):
+    """
+    Сетевой опрос ОДНОГО сервера — HTTP к самому TRASSIR, без единого
+    обращения к БД. Специально вынесено в отдельную функцию, чтобы её
+    можно было безопасно запускать параллельно в пуле потоков (см.
+    collect()) — sqlite-соединение при этом остаётся одно и живёт
+    только в основном потоке, здесь мы его не трогаем вообще.
+
+    Раньше collect() опрашивал серверы последовательно, с таймаутом
+    10 сек на каждый (TrassirClient.get()) — при N серверах и хотя бы
+    парах недоступных одновременно (ровно сценарий из нагрузочного
+    теста: несколько регистраторов падают разом) один цикл опроса мог
+    растянуться на N×10 сек, легко перекрыв сам poll_interval
+    (по умолчанию 15 сек) и провоцируя наложение циклов друг на друга.
+    Теперь все N серверов опрашиваются одновременно — весь цикл
+    ограничен ХУДШИМ из таймаутов, а не их суммой.
+    """
+    server_id = server["id"]
+    client = TrassirClient({
+        "ip": server["ip"],
+        "port": server["port"],
+        "ssl": bool(server["ssl"]),
+        "sdk_password": server["sdk_password"]
+    })
+
+    health = client.get()
+    channels_info = None
+
+    if health["ok"] and (health["ch_t"] > health["ch_o"] or server_id in servers_with_open_cam_alerts):
+        try:
+            channels_info = client.get_channels_info()
+        except Exception as e:
+            print(f"  {server['name']}: ошибка получения каналов: {e}")
+
+    return server_id, health, channels_info
+
+
 def collect():
     """
     Основная функция сбора данных.
@@ -858,23 +896,40 @@ def collect():
         ).fetchall())
         
         updates = []
-        
-        # Обрабатываем каждый сервер
+
+        # Какие серверы уже имеют активный алерт "камера офлайн" — считаем
+        # ОДНИМ запросом заранее (а не по одному внутри цикла на сервер,
+        # как было раньше), чтобы решение "нужен ли get_channels_info()"
+        # для параллельного опроса не требовало доступа к БД из потоков.
+        servers_with_open_cam_alerts = {
+            row["server_id"] for row in conn.execute(
+                "SELECT DISTINCT server_id FROM alerts WHERE msg LIKE 'Камера офлайн:%' AND ack = 0"
+            ).fetchall()
+        }
+
+        # Опрашиваем все серверы ОДНОВРЕМЕННО (см. _fetch_server_data) —
+        # весь цикл ограничен худшим таймаутом, а не суммой N таймаутов.
+        fetched = {}
+        if servers:
+            with ThreadPoolExecutor(max_workers=min(len(servers), 20)) as executor:
+                futures = [
+                    executor.submit(_fetch_server_data, server, servers_with_open_cam_alerts)
+                    for server in servers
+                ]
+                for future in as_completed(futures):
+                    fetched_server_id, fetched_health, fetched_channels_info = future.result()
+                    fetched[fetched_server_id] = (fetched_health, fetched_channels_info)
+
+        # Дальше — обычная последовательная обработка результатов и запись
+        # в БД одним соединением (sqlite3-соединения не потокобезопасны
+        # между собой, поэтому все INSERT/UPDATE остаются в основном потоке,
+        # распараллелен только медленный сетевой опрос выше).
         for server in servers:
             server_id = server["id"]
             server_name = server["name"]
-            
-            # Создаём клиент для этого сервера
-            client = TrassirClient({
-                "ip": server["ip"],
-                "port": server["port"],
-                "ssl": bool(server["ssl"]),
-                "sdk_password": server["sdk_password"]
-            })
-            
-            # Получаем данные о здоровье
-            health = client.get()
-            
+
+            health, channels_info = fetched[server_id]
+
             if health["ok"]:
                 # ============================================
                 # Сохраняем в историю
@@ -908,27 +963,15 @@ def collect():
                 """, (server_id,))
                 conn.commit()
 
-                # Инициализируем channels_info
-                channels_info = None
+                # channels_info уже получен параллельно в _fetch_server_data()
+                # (см. начало collect()) — здесь только раскладываем его на
+                # offline_names, сетевой запрос сюда не переносим.
                 offline_names = []
-
-                # ============================================
-                # ПОЛУЧАЕМ СОСТОЯНИЕ КАНАЛОВ (если есть отвал)
-                # ============================================
-                if health["ch_t"] > health["ch_o"] or conn.execute(
-                    "SELECT id FROM alerts WHERE server_id = ? AND msg LIKE 'Камера офлайн:%' AND ack = 0",
-                    (server_id,)
-                ).fetchone():
-                    # Есть отвал или были активные алерты — запрашиваем состояние каналов
-                    try:
-                        channels_info = client.get_channels_info()
-                        if channels_info and channels_info.get("ok"):
-                            for ch_name, is_online in channels_info["channels"].items():
-                                if not is_online:
-                                    offline_names.append(ch_name)
-                            print(f"  {server_name}: офлайн каналов: {len(offline_names)}")
-                    except Exception as e:
-                        print(f"  {server_name}: ошибка получения каналов: {e}")
+                if channels_info and channels_info.get("ok"):
+                    for ch_name, is_online in channels_info["channels"].items():
+                        if not is_online:
+                            offline_names.append(ch_name)
+                    print(f"  {server_name}: офлайн каналов: {len(offline_names)}")
 
                 # ============================================
                 # ВОССТАНОВЛЕНИЕ — ЗАКРЫВАЕМ АЛЕРТЫ ПО КАМЕРАМ
