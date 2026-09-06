@@ -190,6 +190,191 @@ missed — this is the exact class of bug fixed in point 3 above, and nothing
 would catch a fresh instance of it except another manual audit or a
 mock-based test like the one already set up here.
 
+## Notification-delivery dedup was per-alert, not per-recipient (2026-09-06)
+
+Found by load-testing the exact scenario this app exists for: several
+servers going down/recovering at once with multiple Telegram
+chats/mail recipients configured. `get_new_alerts()` in both bots
+deduped on `NOT EXISTS (... WHERE alert_key = ?)` with no recipient
+filter — an alert counted as "sent" the moment it succeeded for *any*
+one recipient. If recipient B had a transient failure (network blip,
+Telegram 429, SMTP timeout) in the same poll where A/C succeeded, B
+never got that alert **again, ever** — the alert had already left the
+"new" set for everyone. Reproduced live with a test harness (fake
+`send_telegram_message`/`send_email` that fails for one recipient only
+on the first poll): confirmed the failed recipient never catches up
+even after the network recovers.
+
+Fixed: `get_new_alerts(chat_id)` / `get_new_alerts(recipient_email)`
+now take the recipient and filter both the "new" and "recovery" EXISTS
+checks by it — each recipient independently retries its own pending
+list. `run_bot()` in both bots restructured from "loop alerts, inner
+loop recipients" to "loop recipients, inner loop alerts" to match.
+Removed `already_sent()` in `tg_bot.py` — dead code, defined but never
+called, and not recipient-aware anyway.
+
+**A second, worse, fully independent bug surfaced while testing the
+fix above:** `mail_bot.py::mark_alert_as_sent()` inserted into a
+`mail_logs.email` column that has never existed — the table's real
+schema (created by `app.py`'s `init_db()`, which installs first per
+the documented order) calls that column `recipient`. The INSERT has
+been silently failing on *every single call* since this project's
+first commit, swallowed by a bare `except Exception: print(...)`.
+Consequence, worse than bug #1 above: `mail_logs` never got a row at
+all, ever, for anyone — so every open alert was re-emailed to every
+recipient on *every* poll cycle (`CHECK_INTERVAL`, not once), forever,
+until the alert closed, and recovery emails never went out at all
+(recovery detection requires at least one existing "sent" row). Fixed
+the column name in both the INSERT and this notifier's own standalone
+`CREATE TABLE mail_logs` (which also said `email` — matters if this
+notifier is ever installed before `install-trassir-monitor.sh` on a
+from-scratch box, `CREATE TABLE IF NOT EXISTS` means whichever schema
+runs first wins).
+
+Also closed while here: `telegram_logs`/`mail_logs` each had their own
+independent **fixed 7-day** cleanup timer, disconnected from
+`retention_days` (default 30) and from whether the alert they
+reference is still open. An alert open longer than 7 days (plausible —
+a chronically low archive) had its "already sent" row deleted out from
+under it, making the *next* poll treat it as brand-new and re-notify
+for no real reason. Moved this cleanup into `app.py`'s own
+`cleanup_old_data()`: a `telegram_logs`/`mail_logs` row is now deleted
+only once its referenced `alerts.id` (stripping any `recovery_`
+prefix) no longer exists in `alerts` — i.e. exactly when the alert
+itself already qualified for retention cleanup, never before, never on
+a separate clock. Removed both bots' own `cleanup_old_logs()`.
+
+## XSS hardening + cookie flags (2026-09-06)
+
+Full audit found no SQL injection (everything already parameterized)
+but real stored/reflected XSS: `renderTelegram()`/`renderMail()` in
+`settings.html` built `innerHTML` (and, for SMTP server/user/from-name/
+monitor URL, `value='...'` *attributes*) by string-concatenating
+recipient names, emails, and SMTP config with zero escaping — all of
+it editable through this app's own (login-gated) API, but still a
+persistent XSS against whoever next opens `/settings`, including a
+hijacked-session scenario. Added a shared `escapeHtml()` in
+`base.html`, applied everywhere a server-supplied string lands in
+`innerHTML` across `dashboard.html`/`settings.html` (recipient
+name/email, SMTP fields, connection-test error text).
+
+Same class of bug, different blast radius, in both notifier bots:
+`server_name`/`server_ip`/the alert message (which embeds TRASSIR's
+own channel names) went into Telegram's `parse_mode=HTML` body and
+into a full HTML email body completely unescaped. Beyond the injection
+angle this is a live reliability bug — a server or camera named with a
+literal `<`/`>`/`&` makes the Telegram markup invalid, Telegram
+returns 400 "can't parse entities", and `send_telegram_message()`
+silently returns `False`: that server's alerts never send, for anyone,
+until its name changes. Added `html.escape()` in
+`format_alert_message()`/`format_test_message()` (`tg_bot.py`) and
+`format_alert_email()`/`format_test_email()` (`mail_bot.py`). In
+`mail_bot.py` specifically the module has to be imported as
+`html_escape_mod`, not `html` — both email-formatting functions
+already use a local variable named `html` for the message body, and
+Python's "any assignment anywhere in a function makes the name local
+for the whole function" rule turns a plain `import html` +
+`html.escape(...)` earlier in the same function into an
+`UnboundLocalError` at runtime, not at import time. Email `Subject` is
+sanitized separately — newlines stripped (header-injection guard) but
+deliberately *not* HTML-escaped, since it's plain text in a mail
+client's subject line, not markup.
+
+Also set `SESSION_COOKIE_HTTPONLY`/`SESSION_COOKIE_SAMESITE="Lax"`
+explicitly on the Flask app (`HTTPONLY` was already the Flask default,
+`SAMESITE` wasn't set at all — modern browsers default an unset
+SameSite to `Lax` themselves, but don't rely on that fallback silently
+holding). Deliberately did **not** set `SESSION_COOKIE_SECURE` —
+README explicitly supports running without SSL (LAN deployment), and
+a `Secure` cookie is simply never sent over plain `http://`, which
+would break login on exactly that supported configuration. Did not add
+CSRF tokens — every mutating endpoint requires a JSON `Content-Type`
+that a plain HTML `<form>` can't produce without JS, and `SameSite=Lax`
+already strips the session cookie from cross-site `fetch()`/XHR;
+adding real tokens would be a bigger change for a residual risk this
+low, not attempted.
+
+## collect() polls servers in parallel now (2026-09-06)
+
+`collect()` used to poll servers strictly sequentially, each with up
+to `TrassirClient`'s own 10s timeout — with N servers and even 2-3
+unresponsive at once (the exact scenario multiple servers going down
+together), one poll cycle could stretch to a meaningful multiple of
+`poll_interval` (default 15s), risking overlapping/backlogged cycles.
+Split into `_fetch_server_data(server, servers_with_open_cam_alerts)`
+— pure network I/O, zero DB access, safe to run in a thread — and
+`collect()` now dispatches all servers' worth of it through a single
+`ThreadPoolExecutor(max_workers=min(len(servers), 20))` before doing
+the usual sequential DB-write/alert logic in the main thread against
+one `sqlite3` connection (connections aren't thread-safe to share, so
+only the I/O is parallelized, never the writes). The "does this server
+need `get_channels_info()`" decision (previously a per-server query
+*inside* the loop) is now one batched `SELECT DISTINCT server_id`
+up front, specifically so worker threads never need any DB handle at
+all — no thread-safety chores to get right. Measured: 12 servers at
+1s simulated response time each — sequential would be ~12s, parallel
+actually takes ~1.0s; a mixed batch (2 slow/timing-out + 5 fast) is
+bounded by the single slowest server, not the sum, as intended.
+
+## History graph is aggregated server-side now (2026-09-06)
+
+`/api/hist/<id>` used to return every raw `health` row in the
+requested window; `server.html`'s `loadHistory()` immediately
+collapses it client-side to `HIST_MAX_POINTS` (60) by chunked
+averaging anyway (chart never shows more than that). At the default
+15s poll interval, the "7д" button was shipping **all ~40 000 raw
+rows** over the wire to do that — ~6MB of JSON, ~380ms just to
+serialize, for a chart that only ever plots 60 points. Moved the exact
+same chunking-average algorithm (`_aggregate_history()`: step =
+`ceil(N/60)`, label = the middle row's `ts` in each chunk, `cpu`/`arch`
+= chunk mean, `ch_online`/`ch_total` = rounded chunk mean) server-side.
+Ranges that already fit in ≤60 raw rows (the common 30-minute/6-hour
+views) are returned unaggregated, byte-for-byte like before — only
+windows that actually need collapsing get touched. Verified: 7-day
+window payload 5959KB → 5.4KB (~1100×) with the aggregated CPU mean
+matching the true underlying mean; boundary at exactly
+60→61 rows confirmed to flip pass-through→aggregated correctly.
+`loadHistory()`'s own client-side aggregation code was deliberately
+left untouched (it's now just a no-op for any response ≤60 rows,
+which is always) — zero risk backward-compat fallback instead of
+coordinating a matching client change.
+
+## Log rotation was silently broken — `copytruncate`, not `create` (2026-09-06)
+
+None of the three systemd units (`trassir-monitor`/`trassir-tgbot`/
+`trassir-mailbot`) declare `ExecReload` — they're plain `print()`-based
+scripts/gunicorn with no SIGHUP handler to reopen their log file. They
+all use `StandardOutput/StandardError=append:<path>`. The original
+`/etc/logrotate.d/trassir-monitor` used `create` + a `postrotate`
+block that ran `systemctl reload <unit>` — for a unit with no
+`ExecReload`, that reload is a no-op (silently swallowed by `|| true`
+in the script), so the already-open file descriptor the process holds
+keeps appending to the *renamed* file. Simulated the exact mechanics
+with real file descriptors: after the very first daily rotation,
+`tail -f logs/system.log` (what README tells an admin to run) shows
+nothing, forever, while genuine output keeps piling into whatever the
+rotated file is now called — and because that file is exactly what the
+*next* rotation cycle tries to `compress`, the live process keeps
+writing raw bytes into it even after gzip has already read it, which
+corrupts the archive and makes that one file's real size effectively
+unbounded for as long as the process runs without a restart. Switched
+to `copytruncate` (copies content out, truncates the *same* inode in
+place — the open fd is unaffected, next write lands in a genuinely
+empty file) and dropped the now-pointless postrotate block entirely.
+
+Separately confirmed (simulated 10 servers, 15s poll, default
+`retention_days=30`, walked a fully-populated 30-day rolling window
+forward day by day): once the window is full, `data/trassir.db`'s file
+size **plateaus exactly** (188.31MB in every one of 8 consecutive
+steady-state checks, zero drift) — SQLite reuses freed pages from
+`cleanup_old_data()`'s deletes without needing `VACUUM`. This ceiling
+is set by `retention_days`, not by how long the service has been
+running — behavior at 4 months is identical to behavior at 40 days.
+Also checked for a `requests.Session`-per-poll descriptor leak (each
+`TrassirClient` opens a fresh one every cycle) — 60 simulated poll
+cycles showed zero open-fd growth; CPython's refcounting closes each
+session immediately once its `collect()` cycle ends, no accumulation.
+
 ## Publishing hygiene
 
 Public repo. Never commit real server hostnames/IPs, ISP/provider names,
