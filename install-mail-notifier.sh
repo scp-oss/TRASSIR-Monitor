@@ -299,7 +299,7 @@ conn.execute("""
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         ts DATETIME,
         alert_key TEXT,
-        email TEXT,
+        recipient TEXT,
         subject TEXT
     )
 """)
@@ -497,17 +497,28 @@ def get_enabled_recipients():
         if conn:
             conn.close()
 
-def get_new_alerts():
+def get_new_alerts(recipient_email):
     """
-    Получает список новых алертов (ещё не отправленных по email).
-    Включает восстановления каналов и серверов.
-    
+    Получает список новых алертов, ещё не отправленных ИМЕННО этому
+    получателю (email).
+
+    Раньше дедупликация была глобальной ("отправлен ли алерт хоть
+    кому-то из получателей"), хотя отправка идёт по получателям
+    независимо — при всплеске (несколько серверов упали одновременно)
+    временная ошибка SMTP для одного адреса, пока остальные получали
+    письмо успешно, навсегда прятала от него это уведомление: сам
+    алерт исчезал из выборки для всех после первой успешной отправки
+    кому угодно, retry не было. Тот же баг, что и в tg_bot.py — там
+    воспроизведён тестом на эмуляции падения 5 серверов одновременно.
+    Теперь обе проверки ниже фильтруют по конкретному recipient.
+
     ВАЖНО: В SQL-запросах русский текст закодирован через
     символы подстановки Python, а не напрямую в SQL.
     """
     conn = get_db()
     try:
-        # Обычные алерты (warning, critical, ещё не отправлялись)
+        recipient_email = str(recipient_email)
+        # Обычные алерты (warning, critical), этому адресу ещё не отправлялись
         alerts_rows = conn.execute(
             """SELECT
                    a.id, a.server_id, a.level, a.msg, a.ts, a.ack, a.resolved_at,
@@ -518,13 +529,14 @@ def get_new_alerts():
                  AND a.level IN ('warning', 'critical')
                  AND NOT EXISTS (
                      SELECT 1 FROM mail_logs ml
-                     WHERE ml.alert_key = CAST(a.id AS TEXT)
+                     WHERE ml.alert_key = CAST(a.id AS TEXT) AND ml.recipient = ?
                  )
-               ORDER BY a.ts ASC"""
+               ORDER BY a.ts ASC""",
+            (recipient_email,)
         ).fetchall()
 
-        # Восстановления: алерты закрылись (ack=1),
-        # мы их отправляли, но ещё не отправляли уведомление о восстановлении
+        # Восстановления: алерты закрылись (ack=1), этому адресу исходную
+        # проблему уже отправляли, а уведомление о восстановлении — ещё нет
         recovery_rows = conn.execute(
             """SELECT
                    a.id, a.server_id, a.level, a.msg, a.ts, a.ack, a.resolved_at,
@@ -535,13 +547,14 @@ def get_new_alerts():
                  AND a.level IN ('warning', 'critical')
                  AND EXISTS (
                      SELECT 1 FROM mail_logs ml
-                     WHERE ml.alert_key = CAST(a.id AS TEXT)
+                     WHERE ml.alert_key = CAST(a.id AS TEXT) AND ml.recipient = ?
                  )
                  AND NOT EXISTS (
                      SELECT 1 FROM mail_logs ml
-                     WHERE ml.alert_key = 'recovery_' || CAST(a.id AS TEXT)
+                     WHERE ml.alert_key = 'recovery_' || CAST(a.id AS TEXT) AND ml.recipient = ?
                  )
-               ORDER BY a.ts ASC"""
+               ORDER BY a.ts ASC""",
+            (recipient_email, recipient_email)
         ).fetchall()
 
         result = []
@@ -641,11 +654,27 @@ def calc_downtime_for_alert(conn, alert):
 
 
 def mark_alert_as_sent(alert_id, email, subject):
-    """Помечает алерт как отправленный"""
+    """
+    Помечает алерт как отправленный.
+
+    Живой баг, найденный при нагрузочном тестировании (2026-09-06):
+    эта функция ВСЕГДА писала в несуществующую колонку `email` —
+    реальная схема таблицы mail_logs (создаётся init_db() в app.py,
+    который ставится ДО этого нотифайера) называет её `recipient`.
+    INSERT падал на КАЖДОМ вызове, исключение проглатывалось (см.
+    except ниже) — таблица mail_logs не получила ни одной строки за
+    всё время существования проекта. Следствие: get_new_alerts()
+    никогда не видела ни одной "уже отправленной" записи, поэтому
+    КАЖДЫЙ открытый алерт уходил повторно на КАЖДОМ цикле проверки
+    (CHECK_INTERVAL) всем получателям — не единожды, а бесконечным
+    потоком дублей, пока алерт не закроется. А уведомления о
+    восстановлении не отправлялись вообще никогда (для recovery_rows
+    нужна хоть одна существующая запись — их не было).
+    """
     conn = get_db()
     try:
         conn.execute(
-            """INSERT OR IGNORE INTO mail_logs (ts, alert_key, email, subject)
+            """INSERT OR IGNORE INTO mail_logs (ts, alert_key, recipient, subject)
                VALUES (datetime('now'), ?, ?, ?)""",
             (str(alert_id), str(email), str(subject))
         )
@@ -1167,15 +1196,17 @@ def run_bot():
                 time.sleep(CHECK_INTERVAL)
                 continue
 
-            alerts = get_new_alerts()
+            # Цикл идёт "по получателям снаружи" — каждый адрес получает и
+            # ретраит СВОЙ собственный список неотправленных алертов
+            # независимо от остальных (см. get_new_alerts() docstring —
+            # раньше общая на всех выборка означала, что временный сбой
+            # SMTP у одного адреса навсегда прятал от него алерт, даже
+            # успешно доставленный остальным).
+            for rcpt in recipients:
+                email = rcpt['email']
+                alerts = get_new_alerts(email)
 
-            for alert in alerts:
-                subject, html_body = format_alert_email(alert, settings)
-                sent_to = []
-
-                for rcpt in recipients:
-                    email = rcpt['email']
-
+                for alert in alerts:
                     if not alert.get('is_recovery'):
                         if alert['level'] == 'critical' and not rcpt.get('critical', True):
                             continue
@@ -1184,17 +1215,14 @@ def run_bot():
                         if alert['level'] == 'info' and not rcpt.get('info', False):
                             continue
 
+                    subject, html_body = format_alert_email(alert, settings)
                     if send_email(email, rcpt.get('name', ''), subject, html_body, settings):
                         key = f"recovery_{alert['id']}" if alert.get('is_recovery') else alert['id']
                         mark_alert_as_sent(key, email, subject)
-                        sent_to.append(email)
                         total_sent += 1
+                        downtime_info = f" | \u043f\u0440\u043e\u0441\u0442\u043e\u0439: {alert['downtime']}" if alert.get('downtime') else ""
+                        print(f"[{datetime.now()}] OK \u041e\u0442\u043f\u0440\u0430\u0432\u043b\u0435\u043d\u043e: {alert['msg'][:60]}{downtime_info} -> {email}")
                         time.sleep(0.2)
-
-                if sent_to:
-                    downtime_info = f" | \u043f\u0440\u043e\u0441\u0442\u043e\u0439: {alert['downtime']}" if alert.get('downtime') else ""
-                    print(f"[{datetime.now()}] OK \u041e\u0442\u043f\u0440\u0430\u0432\u043b\u0435\u043d\u043e: {alert['msg'][:60]}{downtime_info}")
-                    print(f"[{datetime.now()}]    \u041f\u043e\u043b\u0443\u0447\u0430\u0442\u0435\u043b\u0438: {', '.join(sent_to)}")
 
             if checks % 360 == 0:
                 cleanup_old_logs()

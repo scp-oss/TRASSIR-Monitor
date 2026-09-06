@@ -739,15 +739,6 @@ def calc_downtime_for_alert(conn, alert):
         return ''
 
 
-def already_sent(conn, alert_id):
-    """Проверяет был ли алерт уже отправлен хоть одному получателю."""
-    row = conn.execute(
-        "SELECT id FROM telegram_logs WHERE alert_key = ? LIMIT 1",
-        (str(alert_id),)
-    ).fetchone()
-    return row is not None
-
-
 def get_health_for_server(conn, server_id):
     """Получает последние данные о здоровье сервера."""
     row = conn.execute(
@@ -762,17 +753,33 @@ def get_health_for_server(conn, server_id):
     return {'cpu': '?', 'ch_online': '?', 'ch_total': '?', 'arch': '?', 'uptime': 0, 'rt': '?'}
 
 
-def get_new_alerts():
+def get_new_alerts(chat_id):
     """
-    Получает список новых алертов (ещё не отправленных).
+    Получает список новых алертов, ещё не отправленных ИМЕННО этому chat_id.
+
+    Раньше дедупликация проверялась глобально ("отправлен ли алерт хоть
+    кому-то"), хотя отправка идёт по получателям независимо — если при
+    всплеске (несколько серверов упали одновременно) отправка одному из
+    N чатов временно не удавалась (сетевая ошибка, лимит Telegram 429),
+    а остальным чатам в ту же секунду удавалась, алерт помечался
+    отправленным навсегда и подводивший чат больше НИКОГДА не получал
+    это уведомление, даже после восстановления сети — retry не было в
+    принципе, поскольку сам алерт исчезал из выборки для всех. Живой
+    баг, подтверждён тестом с эмуляцией одновременного падения 5
+    серверов и одного "плохого" получателя. Теперь каждый чат
+    проверяется независимо — обе проверки ниже фильтруют по chat_id.
 
     Включает:
-      - Обычные алерты (ack=0, warning/critical)
-      - Восстановления каналов и серверов (level=info, msg содержит 'восстановлен')
+      - Обычные алерты (ack=0, warning/critical), которые этот чат
+        ещё не получал
+      - Восстановления — только для алертов, о проблеме которых этот
+        же чат уже был уведомлён (иначе получится "восстановлено" без
+        предшествующего "сломалось")
     """
     conn = get_database_connection()
     try:
-        # --- Обычные алерты (ack=0, ещё не отправлялись) ---
+        chat_id = str(chat_id)
+        # --- Обычные алерты (ack=0, этому чату ещё не отправлялись) ---
         alerts_rows = conn.execute(
             """SELECT
                    a.id, a.server_id, a.level, a.msg, a.ts, a.ack, a.resolved_at,
@@ -783,14 +790,15 @@ def get_new_alerts():
                  AND a.level IN ('warning', 'critical')
                  AND NOT EXISTS (
                      SELECT 1 FROM telegram_logs tl
-                     WHERE tl.alert_key = CAST(a.id AS TEXT)
+                     WHERE tl.alert_key = CAST(a.id AS TEXT) AND tl.chat_id = ?
                  )
-               ORDER BY a.ts ASC"""
+               ORDER BY a.ts ASC""",
+            (chat_id,)
         ).fetchall()
 
-        # --- Восстановления: алерты которые закрылись (ack=1)
-        #     но в telegram_logs есть запись об отправке (значит мы их отправляли)
-        #     и нет записи о восстановлении (alert_key = 'recovery_' + id) ---
+        # --- Восстановления: алерты которые закрылись (ack=1),
+        #     этому чату исходную проблему уже отправляли, а
+        #     уведомление о восстановлении — ещё нет ---
         recovery_rows = conn.execute(
             """SELECT
                    a.id, a.server_id, a.level, a.msg, a.ts, a.ack, a.resolved_at,
@@ -801,13 +809,14 @@ def get_new_alerts():
                  AND a.level IN ('warning', 'critical')
                  AND EXISTS (
                      SELECT 1 FROM telegram_logs tl
-                     WHERE tl.alert_key = CAST(a.id AS TEXT)
+                     WHERE tl.alert_key = CAST(a.id AS TEXT) AND tl.chat_id = ?
                  )
                  AND NOT EXISTS (
                      SELECT 1 FROM telegram_logs tl
-                     WHERE tl.alert_key = 'recovery_' || CAST(a.id AS TEXT)
+                     WHERE tl.alert_key = 'recovery_' || CAST(a.id AS TEXT) AND tl.chat_id = ?
                  )
-               ORDER BY a.ts ASC"""
+               ORDER BY a.ts ASC""",
+            (chat_id, chat_id)
         ).fetchall()
 
         result = []
@@ -961,14 +970,18 @@ def run_bot():
                 time.sleep(CHECK_INTERVAL)
                 continue
 
-            alerts = get_new_alerts()
+            # Цикл идёт "по получателям снаружи" — каждый чат получает и
+            # ретраит СВОЙ собственный список неотправленных алертов
+            # независимо от остальных (см. get_new_alerts() docstring —
+            # раньше цикл шёл "по алертам снаружи" с общей на все чаты
+            # выборкой, из-за чего временный сбой у одного получателя
+            # навсегда прятал от него алерт, даже успешно отправленный
+            # остальным).
+            for chat in chats:
+                chat_id = chat['chat_id']
+                alerts = get_new_alerts(chat_id)
 
-            for alert in alerts:
-                text = format_alert_message(alert)
-                sent_to = []
-
-                for chat in chats:
-                    chat_id = chat['chat_id']
+                for alert in alerts:
                     lvl = alert['level']
 
                     # Фильтрация по типу алерта
@@ -982,18 +995,15 @@ def run_bot():
                     elif lvl == 'info' and not chat.get('info', False):
                         continue
 
+                    text = format_alert_message(alert)
                     if send_telegram_message(chat_id, text):
                         # Для восстановлений пишем отдельный ключ чтобы не путать с оригинальным алертом
                         key = f"recovery_{alert['id']}" if alert.get('is_recovery') else alert['id']
                         mark_alert_as_sent(key, chat_id)
-                        sent_to.append(str(chat_id))
                         total_sent += 1
+                        downtime_info = f" | простой: {alert['downtime']}" if alert.get('downtime') else ""
+                        print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] OK {alert['msg'][:60]}{downtime_info} -> {chat_id}")
                         time.sleep(0.05)
-
-                if sent_to:
-                    downtime_info = f" | простой: {alert['downtime']}" if alert.get('downtime') else ""
-                    print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] OK {alert['msg'][:60]}{downtime_info}")
-                    print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}]    -> {', '.join(sent_to)}")
 
             # Очистка каждые 6 минут (360 итераций)
             if checks % 360 == 0:
