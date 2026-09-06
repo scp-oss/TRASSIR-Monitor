@@ -4499,6 +4499,23 @@ echo "    ✓ Деинсталлятор создан: /usr/local/bin/trassir-mo
 # Настройка ротации логов
 echo ""
 echo "  • Настройка ротации логов (logrotate)..."
+# copytruncate, не create+postrotate-reload: все три systemd-юнита пишут
+# через StandardOutput/StandardError=append:<путь> и НЕ объявляют
+# ExecReload (обычные print()-скрипты, никакого обработчика SIGHUP для
+# переоткрытия лог-файла нет). При стратегии create логротейт
+# переименовывает файл и создаёт новый пустой, а уже открытый файловый
+# дескриптор процесса продолжает писать в СТАРЫЙ инод (теперь под именем
+# system.log.1) — "systemctl reload" в postrotate для юнита без
+# ExecReload ничего не делает, `|| true` эту неудачу тихо проглатывает.
+# Итог живьём: tail -f logs/system.log (именно то, что советует README)
+# показывает пустоту уже после первой же ежедневной ротации, а реальный
+# вывод продолжает копиться в переименованном/сжатом файле, который
+# процесс не глядя допишет ещё раз следующим циклом ротации — то есть
+# РЕАЛЬНЫЙ файл лога не ограничен вообще, просто прячется под чужим
+# именем, пока сервис не перезапустят вручную. Подтверждено симуляцией
+# перед этим исправлением. copytruncate копирует содержимое и обнуляет
+# ТОТ ЖЕ инод на месте — открытый дескриптор процесса ничего не замечает,
+# следующая запись уже идёт в свежий файл, без reload/restart.
 cat > /etc/logrotate.d/trassir-monitor << 'LOGROTEOF'
 /opt/trassir-monitor/logs/*.log {
     daily
@@ -4507,15 +4524,10 @@ cat > /etc/logrotate.d/trassir-monitor << 'LOGROTEOF'
     delaycompress
     missingok
     notifempty
-    create 0664 www-data www-data
-    postrotate
-        systemctl reload trassir-monitor 2>/dev/null || true
-        systemctl reload trassir-tgbot 2>/dev/null || true
-        systemctl reload trassir-mailbot 2>/dev/null || true
-    endscript
+    copytruncate
 }
 LOGROTEOF
-echo "    ✓ Logrotate настроен (ежедневно, 7 дней, сжатие)"
+echo "    ✓ Logrotate настроен (ежедневно, 7 дней, сжатие, copytruncate)"
 
 
 # Настройка прав доступа
