@@ -828,6 +828,72 @@ disagrees with another and nothing gets cleaned up."
    end-to-end through its Uninstall submenu to confirm the simplified,
    ungated menu items still complete correctly.
 
+## Update-mode's port recovery could silently guess wrong on a genuinely old install (found 2026-09-07)
+
+Live follow-up report, same session as the two fixes above: user chose
+"1. Install Dashboard" against a leftover install, confirmed the
+"already installed — reinstall anyway?" prompt, and was surprised that
+**no** port/interval/password questions followed at all — correct,
+intentional update-mode behavior (see "install-trassir-monitor.sh
+destroyed the entire database" above), but asked to "check carefully"
+because a silent, no-questions-asked path is exactly where a wrong
+silent assumption would be easiest to miss.
+
+Checked, and there was a real gap: `WEB_PORT` recovery in update mode
+only ever tried `$INSTALL_DIR/data/.install_meta` — a file that only
+exists on installs that have already gone through *this specific*
+version of the script at least once. `.install_meta` didn't exist
+before this same engagement added it a few commits ago, so **any
+install old enough to be called "a leftover from the old version" is
+*guaranteed* to be missing it** — the exact case the user was actually
+testing. Without it, the code silently fell back to a hardcoded `8080`
+— and worse, the message printed alongside it unconditionally claimed
+"Порт веб-интерфейса (сохранён с прошлой установки): 8080", stating a
+guess as if it were a verified, recovered fact. If the real previous
+port were anything else, this would have silently reconfigured nginx to
+listen on the wrong port with no warning at all — a working install
+turned unreachable by an "update" that asked zero questions and gave no
+indication anything was uncertain.
+
+**Fixed with a three-tier recovery, each tier only used if the previous
+one came up empty, each one honestly labeled in the printed message**:
+
+1. `.install_meta`, if present — most reliable, "из файла метаданных".
+2. Parse the real `WEB_PORT` straight out of the *still-live*,
+   not-yet-deleted `/etc/nginx/sites-available/trassir-monitor` (`grep
+   -oP 'listen\s+\K[0-9]+(?=\s+default_server)'`, anchored to the IPv4
+   `listen` line specifically so it can't accidentally match a digit
+   inside the neighboring `listen [::]:PORT` line) — "определён по
+   действующему конфигу nginx". This is the one that actually closes
+   the gap for a pre-`.install_meta` install: the nginx config's own
+   `listen $WEB_PORT default_server;` line has been written by *every*
+   version of this installer's nginx-config step, so it survives
+   regardless of how old the install is, right up until ШАГ 1 deletes it
+   a few steps later in the same run. (Confirmed this recovery idea
+   already has precedent elsewhere in this codebase —
+   `install-mail-notifier.sh`/`install-telegram-notifier.sh` both
+   already parse the live port the same way, `grep -m1 'listen ' ... |
+   grep -oP '\d+'`, for their own final-summary URL — so `grep -oP`
+   itself was already proven safe on this project's target Debian
+   12/13, not a new dependency risk.)
+3. If *neither* source yields a port — genuinely no signal at all, not
+   just "the automatic answer happened to be 8080" — falls back to an
+   explicit interactive prompt with a visible warning explaining why
+   it's asking, instead of ever silently assuming a number. Labeled
+   "введён вручную — автоопределение не сработало" so it's obvious this
+   run's port came from the person, not from anything detected.
+
+Every recovered/entered value's actual source is now printed next to
+the port itself, every time — `Порт веб-интерфейса: 8080 (источник)` —
+so an update-mode run is never ambiguous about whether that number is a
+confirmed fact or a fallback guess, closing exactly the "why didn't it
+ask me anything, can I trust what it assumed" question the report
+raised. Verified all three tiers directly (meta file present; meta file
+absent but a real nginx config with a *different* port present, confirming
+recovery — not a coincidental match to the 8080 default; neither present,
+confirming the interactive fallback fires and is clearly labeled) plus a
+full `bash -n`/`py_compile` pass to confirm nothing else was disturbed.
+
 ## Publishing hygiene
 
 Public repo. Never commit real server hostnames/IPs, ISP/provider names,
