@@ -752,6 +752,82 @@ new house style for one script.
   itself picking up the local sibling copy and completing end-to-end
   with the menu correctly showing `[false]` for all three afterward.
 
+## Leftovers from a partial/old install: launcher said "installed", uninstaller said "not found" (found 2026-09-07)
+
+Live bug report, one day after `uninstall-trassir-monitor.sh` shipped:
+on a server carrying leftovers from an older/partially-updated install,
+the launcher reported the dashboard as installed, but choosing
+"Uninstall Dashboard" printed "TRASSIR Monitor не обнаружен" and
+touched nothing. Root cause was two independent, differently-scoped
+"is it installed" checks disagreeing with each other, each looking at a
+different subset of the same real system:
+
+- `launcher-trassir-monitor.sh`'s `dashboard_installed()` is
+  *deliberately* strict — `app.py` **AND** an executable
+  `venv/bin/python3` — because it answers "is there a working install
+  to reinstall over / depend on for Telegram+Email", not "is there
+  anything at all on disk."
+- `uninstall-trassir-monitor.sh`'s own `HAS_DASHBOARD` (as first
+  shipped) checked a much narrower set: just the systemd unit *via
+  `systemctl list-unit-files`* OR `app.py`. Nothing else.
+
+On a real box with leftovers — e.g. a lingering nginx site config or a
+systemd unit *file on disk* that `systemctl list-unit-files` doesn't
+surface for whatever reason (masked unit, a `daemon-reload` never run,
+subtly different systemd caching behavior across versions) while
+`app.py` had already been removed by an earlier partial cleanup — the
+launcher's stricter check could go either way independently of what the
+uninstaller's narrower check saw, and the two provided no guarantee of
+agreeing. The user only ever sees this as "one part of the tool
+disagrees with another and nothing gets cleaned up."
+
+**Fixed two ways, not one:**
+
+1. **`HAS_DASHBOARD`/`HAS_TGBOT`/`HAS_MAIL` in all three uninstall
+   scripts now check every trace this project could plausibly leave
+   behind**, not just the two original signals: `$INSTALL_DIR` existing
+   at all, the systemd unit *file on disk* (`/etc/systemd/system/
+   trassir-monitor.service` etc., independent of what `systemctl
+   list-unit-files` currently reports), both nginx site-config
+   locations, and the two generated companion commands
+   (`trassir-monitor-uninstall`/`trassir-monitor-set-password`). Any
+   ONE of these present is enough to trigger the full cleanup flow —
+   safe to do because every actual removal step was already written
+   tolerant of missing targets (`rm -f`, `systemctl stop ... || true`),
+   so running the whole routine against a mostly-empty leftover state
+   just quietly skips whatever isn't there and removes whatever is.
+2. **The launcher no longer makes its own "installed?" decision for the
+   Uninstall submenu at all.** Items 1-4 used to gate each
+   `_run_installer` call behind `dashboard_installed()`/
+   `telegram_installed()`/`email_installed()` — the exact strict checks
+   meant for a different purpose (install-gating) — printing "not
+   installed" from the launcher's own logic before the real uninstall
+   script ever got a chance to look for itself. Now every uninstall
+   menu choice unconditionally calls the corresponding `uninstall-*.sh`
+   and lets THAT script's own (now-broadened) detection be the single
+   source of truth — on an empty system it prints its own "не
+   обнаружен" message, which is a normal, expected outcome, not
+   something the launcher needs to pre-empt or second-guess. This is a
+   structural fix, not a patch: it's no longer possible for the launcher
+   and an uninstall script to disagree about installed state, because
+   only one of them is ever asked the question. `dashboard_installed()`
+   itself is untouched and still used exactly where its strict
+   definition is actually correct — install-gating for items 1/2/3/4's
+   install-side reinstall prompts and the Telegram/Email dependency
+   check.
+3. Verified with a scripted "leftover tail" scenario matching the
+   report's shape: `$INSTALL_DIR` present as an otherwise-empty
+   directory, a stray nginx site-config file, `app.py` absent, no
+   systemd unit visible to a faked `systemctl list-unit-files` — before
+   this fix this combination would have hit "не обнаружен"; after it,
+   `HAS_DASHBOARD` correctly trips on the nginx-config signal alone, the
+   full confirm-and-clean flow runs, and the leftover config file is
+   actually removed. Re-verified the genuinely-empty case still
+   correctly reports "не обнаружен" (this fix broadens detection, it
+   doesn't make it fire on nothing), and re-ran the full launcher
+   end-to-end through its Uninstall submenu to confirm the simplified,
+   ungated menu items still complete correctly.
+
 ## Publishing hygiene
 
 Public repo. Never commit real server hostnames/IPs, ISP/provider names,

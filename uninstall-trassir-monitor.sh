@@ -52,16 +52,39 @@ fi
 # ============================================
 # ОПРЕДЕЛЯЕМ ЧТО УСТАНОВЛЕНО
 # ============================================
+# Намеренно широкая проверка "по ЛЮБОМУ следу", а не только по "полному
+# рабочему комплекту" (app.py + venv) — живой баг 2026-09-07: после
+# частично неудачного/устаревшего обновления или ручной чистки на диске
+# мог остаться, например, systemd-юнит без $INSTALL_DIR, или сама папка
+# без app.py, или конфиг nginx без сервиса. Узкая проверка "всё сразу или
+# ничего" в таком случае говорила "не обнаружен" и молча оставляла эти
+# хвосты нетронутыми — а другой код в проекте (например, launcher'а
+# собственный dashboard_installed(), который целенаправленно строже,
+# см. его комментарий) мог в этот же момент сообщать "установлен",
+# опираясь на другой конкретный файл. Здесь любой ОДИН найденный след —
+# уже достаточное основание предложить полную чистку; сами шаги удаления
+# ниже и так написаны терпимо к недостающим целям (rm -f, systemctl ...
+# || true), так что прогнать их по частично-пустому состоянию безопасно.
 HAS_DASHBOARD=0
-systemctl list-unit-files 2>/dev/null | grep -q "^trassir-monitor\.service" && HAS_DASHBOARD=1
+[ -d "$INSTALL_DIR" ] && HAS_DASHBOARD=1
 [ -f "$INSTALL_DIR/app/app.py" ] && HAS_DASHBOARD=1
+[ -f "/etc/systemd/system/trassir-monitor.service" ] && HAS_DASHBOARD=1
+systemctl list-unit-files 2>/dev/null | grep -q "^trassir-monitor\.service" && HAS_DASHBOARD=1
+[ -f "/etc/nginx/sites-available/trassir-monitor" ] && HAS_DASHBOARD=1
+[ -f "/etc/nginx/sites-enabled/trassir-monitor" ] && HAS_DASHBOARD=1
+[ -e /usr/local/bin/trassir-monitor-uninstall ] && HAS_DASHBOARD=1
+[ -e /usr/local/bin/trassir-monitor-set-password ] && HAS_DASHBOARD=1
 
 if [ $HAS_DASHBOARD -eq 0 ]; then
     echo -e "${YELLOW}⚠ TRASSIR Monitor не обнаружен.${NC}"
     echo ""
     echo "Проверено:"
-    echo "  • Сервис trassir-monitor"
+    echo "  • Каталог $INSTALL_DIR"
     echo "  • $INSTALL_DIR/app/app.py"
+    echo "  • Сервис trassir-monitor (systemd-юнит и файл)"
+    echo "  • Конфиги nginx (sites-available/sites-enabled)"
+    echo "  • /usr/local/bin/trassir-monitor-uninstall"
+    echo "  • /usr/local/bin/trassir-monitor-set-password"
     exit 0
 fi
 
@@ -69,6 +92,8 @@ HAS_TGBOT=0
 HAS_MAIL=0
 systemctl list-unit-files 2>/dev/null | grep -q "trassir-tgbot" && HAS_TGBOT=1
 systemctl list-unit-files 2>/dev/null | grep -q "trassir-mailbot" && HAS_MAIL=1
+[ -f "/etc/systemd/system/trassir-tgbot.service" ] && HAS_TGBOT=1
+[ -f "/etc/systemd/system/trassir-mailbot.service" ] && HAS_MAIL=1
 [ -f "$INSTALL_DIR/app/tg_bot.py" ] && HAS_TGBOT=1
 [ -f "$INSTALL_DIR/app/mail_bot.py" ] && HAS_MAIL=1
 

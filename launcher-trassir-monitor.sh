@@ -269,31 +269,34 @@ do_uninstall() {
     echo ""
     read -p "Choice: " choice
 
+    # Пункты 1-4 НЕ проверяют dashboard_installed()/telegram_installed()/
+    # email_installed() перед запуском — раньше проверяли, и это была
+    # прямая причина живого бага 2026-09-07: dashboard_installed() (для
+    # решения "предлагать ли переустановку/зависимые уведомления")
+    # специально строгий — требует ОДНОВРЕМЕННО app.py И исполняемый
+    # venv/bin/python3 — а uninstall-trassir-monitor.sh проверял по-
+    # другому и по более узкому набору признаков. На сервере с хвостами
+    # от старой/частично обновлённой установки эти два расходились: один
+    # говорил "установлен", другой в ответ на реальную попытку удаления —
+    # "не обнаружен", и мусор так и оставался на диске. Вместо синхронизации
+    # двух независимых проверок каждый пункт теперь просто передаёт решение
+    # единственному месту, которое его принимает — самому uninstall-*.sh
+    # скрипту (его собственная проверка расширена ловить и частичные
+    # хвосты, см. его же комментарий) — оно единственное присутствует и в
+    # выводе "ничего не найдено", и в реальном удалении.
     case "$choice" in
         1)
-            if dashboard_installed; then
-                # uninstall-trassir-monitor.sh уже само обнаруживает и снимает
-                # Telegram/Email вместе с дашбордом (без него они всё равно
-                # не работают) — отдельно вызывать uninstall-telegram-bot.sh/
-                # uninstall-mail-notifier.sh здесь не нужно.
-                _run_installer "uninstall-trassir-monitor.sh"
-            else
-                echo -e "${YELLOW}Dashboard is not installed.${NC}"
-            fi
+            # uninstall-trassir-monitor.sh уже само обнаруживает и снимает
+            # Telegram/Email вместе с дашбордом (без него они всё равно
+            # не работают) — отдельно вызывать uninstall-telegram-bot.sh/
+            # uninstall-mail-notifier.sh здесь не нужно.
+            _run_installer "uninstall-trassir-monitor.sh"
             ;;
         2)
-            if telegram_installed; then
-                _run_installer "uninstall-telegram-bot.sh"
-            else
-                echo -e "${YELLOW}Telegram notifications are not installed.${NC}"
-            fi
+            _run_installer "uninstall-telegram-bot.sh"
             ;;
         3)
-            if email_installed; then
-                _run_installer "uninstall-mail-notifier.sh"
-            else
-                echo -e "${YELLOW}Email notifications are not installed.${NC}"
-            fi
+            _run_installer "uninstall-mail-notifier.sh"
             ;;
         4)
             # Уведомления снимаем ДО дашборда через их собственные
@@ -301,15 +304,12 @@ do_uninstall() {
             # telegram_logs/mail_logs/telegram_chats/mail_recipients) —
             # к моменту вызова uninstall-trassir-monitor.sh они уже не
             # обнаружатся и не потребуют повторного подтверждения на них.
-            if telegram_installed; then
-                _run_installer "uninstall-telegram-bot.sh"
-            fi
-            if email_installed; then
-                _run_installer "uninstall-mail-notifier.sh"
-            fi
-            if dashboard_installed; then
-                _run_installer "uninstall-trassir-monitor.sh"
-            fi
+            # Каждый скрипт сам молча ничего не делает, если ему нечего
+            # удалять — три "не обнаружено" подряд на пустой системе это
+            # ожидаемый, а не ошибочный вывод.
+            _run_installer "uninstall-telegram-bot.sh"
+            _run_installer "uninstall-mail-notifier.sh"
+            _run_installer "uninstall-trassir-monitor.sh"
             ;;
         0)
             return 0
