@@ -23,7 +23,7 @@ clear
 # Баннер
 echo -e "${GREEN}╔══════════════════════════════════════════════╗${NC}"
 echo -e "${GREEN}║                                              ║${NC}"
-echo -e "${GREEN}║   TRASSIR Monitor v12.0 — Final Complete     ║${NC}"
+echo -e "${GREEN}║   TRASSIR Monitor v13.0 — Final Complete     ║${NC}"
 echo -e "${GREEN}║   Имена каналов • Алерты • Live дашборд      ║${NC}"
 echo -e "${GREEN}║   Debian 12/13 • gevent • Python 3.12/3.13   ║${NC}"
 echo -e "${GREEN}║                                              ║${NC}"
@@ -44,73 +44,118 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 # ============================================
-# ЗАПРОС ПАРАМЕТРОВ У ПОЛЬЗОВАТЕЛЯ
+# СВЕЖАЯ УСТАНОВКА ИЛИ ОБНОВЛЕНИЕ?
 # ============================================
-echo -e "${YELLOW}Настройка параметров установки:${NC}"
-echo ""
-
-echo -e "  ${BOLD}Порт Web-интерфейса${NC}"
-echo -e "  На каком порту будет доступен веб-интерфейс мониторинга"
-read -p "  Порт (Enter для 8080): " WEB_PORT
-WEB_PORT=${WEB_PORT:-8080}
-
-# Проверяем что внешний порт не занят
-if ss -tlnp 2>/dev/null | grep -q ":${WEB_PORT} " || \
-   netstat -tlnp 2>/dev/null | grep -q ":${WEB_PORT} "; then
-    echo -e "  ${YELLOW}⚠ Порт ${WEB_PORT} уже используется другим процессом!${NC}"
-    echo -e "  Проверьте: ${CYAN}ss -tlnp | grep :${WEB_PORT}${NC}"
-    read -p "  Продолжить установку? (y/N): " cont
-    [[ $cont =~ ^[Yy]$ ]] || exit 1
+# Единственный надёжный признак существующей установки — сама база
+# данных, а не отдельный флаг/маркер, который может разойтись с
+# реальностью. Раньше повторный запуск этого скрипта БЕЗУСЛОВНО удалял
+# $INSTALL_DIR (см. ШАГ 1 ниже) — то есть любая "переустановка ради
+# обновления кода" молча уничтожала всю БД (серверы, историю, алерты,
+# пароль администратора) без единого предупреждения. Теперь наличие
+# $INSTALL_DIR/data/trassir.db переключает скрипт в режим обновления:
+# порт и пароль не переспрашиваются, данные сохраняются вокруг ШАГа 1.
+IS_UPDATE=0
+META_FILE="$INSTALL_DIR/data/.install_meta"
+if [ -f "$INSTALL_DIR/data/trassir.db" ]; then
+    IS_UPDATE=1
 fi
 
-# Вычисляем внутренний порт gunicorn — WEB_PORT+1, ищем первый свободный
-APP_PORT=$((WEB_PORT + 1))
-while ss -tlnp 2>/dev/null | grep -q ":${APP_PORT} "; do
-    APP_PORT=$((APP_PORT + 1))
-done
-echo -e "  ${CYAN}Внутренний порт приложения: ${APP_PORT}${NC}"
-echo ""
+if [ "$IS_UPDATE" -eq 1 ]; then
+    echo -e "${CYAN}Обнаружена существующая установка в $INSTALL_DIR${NC}"
+    echo -e "${CYAN}Режим ОБНОВЛЕНИЯ: код/шаблоны/сервисы будут пересозданы,${NC}"
+    echo -e "${CYAN}база данных, порт и пароль администратора — сохранены.${NC}"
+    echo ""
 
-echo -e "  ${BOLD}Интервал опроса TRASSIR${NC}"
-echo -e "  Как часто (в секундах) опрашивать серверы TRASSIR"
-echo -e "  Рекомендуется: 15 секунд"
-read -p "  Интервал (Enter для 15): " POLL
-POLL=${POLL:-15}
-echo ""
+    # Порт читаем из метафайла, записанного при прошлой установке (см.
+    # ШАГ 3 ниже) — вместо повторного вопроса пользователю. Если
+    # метафайла нет (обновление установки, сделанной до появления этой
+    # логики) — 8080 как безопасный дефолт.
+    if [ -f "$META_FILE" ]; then
+        # shellcheck disable=SC1090
+        source "$META_FILE"
+    fi
+    WEB_PORT=${WEB_PORT:-8080}
+    APP_PORT=$((WEB_PORT + 1))
+    while ss -tlnp 2>/dev/null | grep -q ":${APP_PORT} "; do
+        APP_PORT=$((APP_PORT + 1))
+    done
+    echo -e "  ${CYAN}Порт веб-интерфейса (сохранён с прошлой установки): ${WEB_PORT}${NC}"
+    echo -e "  ${CYAN}Внутренний порт приложения: ${APP_PORT}${NC}"
+    echo ""
+else
+    # ============================================
+    # ЗАПРОС ПАРАМЕТРОВ У ПОЛЬЗОВАТЕЛЯ
+    # ============================================
+    echo -e "${YELLOW}Настройка параметров установки:${NC}"
+    echo ""
 
-echo -e "  ${BOLD}Пароль администратора${NC}"
-echo -e "  Без входа дашборд можно только просматривать — добавление и"
-echo -e "  удаление серверов, изменение настроек требуют этот пароль."
-echo -e "  Позже сменить прямо на сервере: ${CYAN}sudo trassir-monitor-set-password${NC}"
-echo ""
-while true; do
-    read -p "  Пароль (Enter — сгенерировать случайный): " ADMIN_PASSWORD
-    if [ -z "$ADMIN_PASSWORD" ]; then
-        ADMIN_PASSWORD=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 16)
-        echo -e "  ${GREEN}✓${NC} Сгенерирован пароль: ${BOLD}${ADMIN_PASSWORD}${NC}"
-        echo -e "  ${RED}Запишите его сейчас — второй раз он нигде не покажется.${NC}"
+    echo -e "  ${BOLD}Порт Web-интерфейса${NC}"
+    echo -e "  На каком порту будет доступен веб-интерфейс мониторинга"
+    read -p "  Порт (Enter для 8080): " WEB_PORT
+    WEB_PORT=${WEB_PORT:-8080}
+
+    # Проверяем что внешний порт не занят
+    if ss -tlnp 2>/dev/null | grep -q ":${WEB_PORT} " || \
+       netstat -tlnp 2>/dev/null | grep -q ":${WEB_PORT} "; then
+        echo -e "  ${YELLOW}⚠ Порт ${WEB_PORT} уже используется другим процессом!${NC}"
+        echo -e "  Проверьте: ${CYAN}ss -tlnp | grep :${WEB_PORT}${NC}"
+        read -p "  Продолжить установку? (y/N): " cont
+        [[ $cont =~ ^[Yy]$ ]] || exit 1
+    fi
+
+    # Вычисляем внутренний порт gunicorn — WEB_PORT+1, ищем первый свободный
+    APP_PORT=$((WEB_PORT + 1))
+    while ss -tlnp 2>/dev/null | grep -q ":${APP_PORT} "; do
+        APP_PORT=$((APP_PORT + 1))
+    done
+    echo -e "  ${CYAN}Внутренний порт приложения: ${APP_PORT}${NC}"
+    echo ""
+
+    echo -e "  ${BOLD}Интервал опроса TRASSIR${NC}"
+    echo -e "  Как часто (в секундах) опрашивать серверы TRASSIR"
+    echo -e "  Рекомендуется: 15 секунд"
+    read -p "  Интервал (Enter для 15): " POLL
+    POLL=${POLL:-15}
+    if ! [[ "$POLL" =~ ^[0-9]+$ ]] || [ "$POLL" -lt 1 ]; then
+        echo -e "  ${YELLOW}Некорректное значение, использую 15 секунд${NC}"
+        POLL=15
+    fi
+    echo ""
+
+    echo -e "  ${BOLD}Пароль администратора${NC}"
+    echo -e "  Без входа дашборд можно только просматривать — добавление и"
+    echo -e "  удаление серверов, изменение настроек требуют этот пароль."
+    echo -e "  Позже сменить прямо на сервере: ${CYAN}sudo trassir-monitor-set-password${NC}"
+    echo ""
+    while true; do
+        read -p "  Пароль (Enter — сгенерировать случайный): " ADMIN_PASSWORD
+        if [ -z "$ADMIN_PASSWORD" ]; then
+            ADMIN_PASSWORD=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 16)
+            echo -e "  ${GREEN}✓${NC} Сгенерирован пароль: ${BOLD}${ADMIN_PASSWORD}${NC}"
+            echo -e "  ${RED}Запишите его сейчас — второй раз он нигде не покажется.${NC}"
+            break
+        fi
+        if [ ${#ADMIN_PASSWORD} -lt 4 ]; then
+            echo -e "  ${YELLOW}Слишком короткий пароль (минимум 4 символа), попробуйте снова${NC}"
+            continue
+        fi
+        read -p "  Повторите пароль: " ADMIN_PASSWORD_CONFIRM
+        if [ "$ADMIN_PASSWORD" != "$ADMIN_PASSWORD_CONFIRM" ]; then
+            echo -e "  ${RED}Пароли не совпадают, попробуйте снова${NC}"
+            continue
+        fi
+        echo -e "  ${GREEN}✓${NC} Пароль принят"
         break
-    fi
-    if [ ${#ADMIN_PASSWORD} -lt 4 ]; then
-        echo -e "  ${YELLOW}Слишком короткий пароль (минимум 4 символа), попробуйте снова${NC}"
-        continue
-    fi
-    read -p "  Повторите пароль: " ADMIN_PASSWORD_CONFIRM
-    if [ "$ADMIN_PASSWORD" != "$ADMIN_PASSWORD_CONFIRM" ]; then
-        echo -e "  ${RED}Пароли не совпадают, попробуйте снова${NC}"
-        continue
-    fi
-    echo -e "  ${GREEN}✓${NC} Пароль принят"
-    break
-done
-echo ""
+    done
+    echo ""
 
-echo -e "${GREEN}✅ Параметры установки:${NC}"
-echo -e "   • Порт Web-интерфейса: ${BOLD}$WEB_PORT${NC}"
-echo -e "   • Интервал опроса: ${BOLD}${POLL} секунд${NC}"
-echo -e "   • Пароль администратора: ${BOLD}задан${NC}"
-echo -e "   • Каталог установки: ${BOLD}$INSTALL_DIR${NC}"
-echo ""
+    echo -e "${GREEN}✅ Параметры установки:${NC}"
+    echo -e "   • Порт Web-интерфейса: ${BOLD}$WEB_PORT${NC}"
+    echo -e "   • Интервал опроса: ${BOLD}${POLL} секунд${NC}"
+    echo -e "   • Пароль администратора: ${BOLD}задан${NC}"
+    echo -e "   • Каталог установки: ${BOLD}$INSTALL_DIR${NC}"
+    echo ""
+fi
 
 # ============================================
 # ШАГ 1: ОЧИСТКА СТАРОЙ УСТАНОВКИ
@@ -130,6 +175,29 @@ if systemctl is-enabled --quiet $SERVICE 2>/dev/null; then
     echo "  • Отключение автозапуска..."
     systemctl disable $SERVICE
     echo "    ✓ Автозапуск отключён"
+fi
+
+# При обновлении сохраняем data/ (БД со всей историей, серверами,
+# алертами и хешем пароля администратора) во временный каталог ВНЕ
+# $INSTALL_DIR перед его удалением ниже — восстанавливается обратно в
+# ШАГе 3, сразу после того как каталог data/ будет создан заново.
+#
+# static/ (bootstrap/chart.js/socket.io/иконки, см. ШАГ 5) сохраняем
+# туда же и по той же причине, но не ради данных, а ради автономности:
+# эти файлы качаются с CDN один раз при самой первой установке, а
+# дальше должны просто оставаться на диске — на обновлении сети может
+# уже не быть вообще (сеть, для которой это всё и делается), и без
+# этой сохранёнки ШАГ 5 остался бы без единого рабочего пакета после
+# `rm -rf $INSTALL_DIR`, потому что качать их заново было бы неоткуда.
+DATA_PRESERVE_DIR=""
+if [ "$IS_UPDATE" -eq 1 ] && [ -d "$INSTALL_DIR/data" ]; then
+    echo "  • Сохранение базы данных и статических файлов перед обновлением..."
+    DATA_PRESERVE_DIR=$(mktemp -d)
+    cp -a "$INSTALL_DIR/data" "$DATA_PRESERVE_DIR/data"
+    if [ -d "$INSTALL_DIR/static" ]; then
+        cp -a "$INSTALL_DIR/static" "$DATA_PRESERVE_DIR/static"
+    fi
+    echo "    ✓ data/ и static/ сохранены во временный каталог"
 fi
 
 # Удаляем старый каталог
@@ -215,6 +283,35 @@ mkdir -p $INSTALL_DIR/static
 mkdir -p $INSTALL_DIR/data
 mkdir -p $INSTALL_DIR/logs
 echo "    ✓ Каталоги созданы"
+
+# Восстанавливаем БД и статические файлы, сохранённые в ШАГе 1 перед
+# удалением старого каталога (только при обновлении — DATA_PRESERVE_DIR
+# пуст на свежей установке). static/ восстанавливаем ДО скачивания
+# ресурсов в ШАГе 5 — _dl() там пропускает файл, если он уже на месте,
+# так что автономная сеть без интернета на обновлении не остаётся без
+# уже однажды скачанных bootstrap/chart.js/socket.io/иконок.
+if [ -n "$DATA_PRESERVE_DIR" ] && [ -d "$DATA_PRESERVE_DIR/data" ]; then
+    echo "  • Восстановление сохранённой базы данных..."
+    rm -rf "$INSTALL_DIR/data"
+    cp -a "$DATA_PRESERVE_DIR/data" "$INSTALL_DIR/data"
+    echo "    ✓ data/ восстановлен ($(du -sh "$INSTALL_DIR/data" 2>/dev/null | cut -f1))"
+fi
+if [ -n "$DATA_PRESERVE_DIR" ] && [ -d "$DATA_PRESERVE_DIR/static" ]; then
+    echo "  • Восстановление сохранённых статических файлов..."
+    rm -rf "$INSTALL_DIR/static"
+    cp -a "$DATA_PRESERVE_DIR/static" "$INSTALL_DIR/static"
+    echo "    ✓ static/ восстановлен ($(du -sh "$INSTALL_DIR/static" 2>/dev/null | cut -f1))"
+fi
+rm -rf "$DATA_PRESERVE_DIR" 2>/dev/null || true
+
+# Метаданные установки — на сегодня только порт, единственное, что
+# нужно молча восстановить на будущем обновлении вместо повторного
+# вопроса пользователю (см. "СВЕЖАЯ УСТАНОВКА ИЛИ ОБНОВЛЕНИЕ?" выше).
+# Живёт внутри data/, поэтому переживает и обновление (сохраняется
+# вместе с БД), и любые операции, кроме полного uninstall.
+cat > $INSTALL_DIR/data/.install_meta << METAEOF
+WEB_PORT=$WEB_PORT
+METAEOF
 
 # Права на data/ сразу — 775 чтобы www-data мог создавать WAL/SHM файлы SQLite
 chown -R www-data:www-data $INSTALL_DIR/data
@@ -314,7 +411,7 @@ echo ""
 cat > $INSTALL_DIR/app/app.py << 'APPEOF'
 #!/usr/bin/env python3
 """
-TRASSIR Monitor v12.0 — Основной файл приложения
+TRASSIR Monitor v13.0 — Основной файл приложения
 Полная версия с определением имён отключённых каналов
 
 Функции:
@@ -2062,7 +2159,7 @@ def api_services_status():
 if __name__ != "__main__":
     # Вывод при запуске через gunicorn
     print("=" * 60)
-    print("  TRASSIR Monitor v12.0")
+    print("  TRASSIR Monitor v13.0")
     print("  Система мониторинга серверов TRASSIR")
     print("=" * 60)
 
@@ -2105,12 +2202,28 @@ echo "  • Скачивание статических ресурсов..."
 
 mkdir -p $INSTALL_DIR/static/fonts
 
+# _DL_FAILED собирает имена файлов, которые не удалось ни найти на
+# месте (восстановленными с прошлой установки), ни скачать — печатается
+# отдельным заметным предупреждением в конце этого шага (см. ниже).
+_DL_FAILED=()
+
 _dl() {
     local url="$1" dest="$2" name="$3"
-    if curl -sL --connect-timeout 15 --retry 2 -o "$dest" "$url" 2>/dev/null && [ -s "$dest" ]; then
+    # Уже есть валидный файл — либо восстановлен на ШАГе 3 (обновление),
+    # либо остался от прерванного повторного запуска. Не перекачиваем:
+    # именно это делает обновление в сети без интернета безопасным —
+    # единственный раз, когда эти файлы обязаны быть реально скачаны,
+    # это самая первая установка.
+    if [ -s "$dest" ]; then
+        echo "    ✓ $name — уже на месте ($(wc -c < "$dest") байт)"
+        return 0
+    fi
+    if curl -sL --connect-timeout 15 --retry 3 --retry-delay 2 -o "$dest" "$url" 2>/dev/null && [ -s "$dest" ]; then
         echo "    ✓ $name ($(wc -c < "$dest") байт)"
     else
         echo "    ⚠ Не удалось скачать $name"
+        rm -f "$dest"
+        _DL_FAILED+=("$name")
     fi
 }
 
@@ -2156,6 +2269,29 @@ FONTEOF
     cat /tmp/bi_clean.css >> "$INSTALL_DIR/static/bootstrap-icons.css"
     rm -f /tmp/bi_clean.css
     echo "    ✓ @font-face обновлён → /static/fonts/"
+fi
+
+# Дашборд ссылается ТОЛЬКО на локальные /static/... пути (никаких CDN
+# в самих шаблонах — см. CLAUDE.md "Готовность к автономной сети"), но
+# это защищает только от обращений к интернету НА КАЖДОЙ загрузке
+# страницы. Если хоть один из файлов выше так и не появился на диске
+# (первая установка без интернета либо интернет пропал посреди неё),
+# дашборд у реальных пользователей будет открываться без стилей/иконок/
+# графиков/live-обновления молча — без этого предупреждения это было бы
+# видно только тем, кто внимательно читает вывод установщика.
+if [ ${#_DL_FAILED[@]} -gt 0 ]; then
+    echo ""
+    echo -e "${RED}⚠️  ВНИМАНИЕ: не удалось получить ${#_DL_FAILED[@]} файл(ов), нужных для автономной работы:${NC}"
+    for _f in "${_DL_FAILED[@]}"; do
+        echo -e "${RED}    ✗ $_f${NC}"
+    done
+    echo -e "${YELLOW}   Дашборд запустится, но без этих файлов часть интерфейса не будет${NC}"
+    echo -e "${YELLOW}   работать (стили, графики, иконки или live-обновления через WebSocket).${NC}"
+    echo -e "${YELLOW}   Сам дашборд НИКОГДА не обращается к внешним CDN сам по себе — только${NC}"
+    echo -e "${YELLOW}   к $INSTALL_DIR/static/, поэтому единственный способ починить это —${NC}"
+    echo -e "${YELLOW}   запустить установку заново при рабочем интернете (уже скачанные${NC}"
+    echo -e "${YELLOW}   файлы не перекачиваются повторно, поэтому это безопасно и быстро).${NC}"
+    echo ""
 fi
 
 # ---------- base.html ----------
@@ -4316,7 +4452,7 @@ echo ""
 # Gunicorn конфигурация
 echo "  • Создание конфигурации Gunicorn..."
 cat > $INSTALL_DIR/gunicorn_config.py << GUNEOF
-# Конфигурация Gunicorn для TRASSIR Monitor v12.0
+# Конфигурация Gunicorn для TRASSIR Monitor v13.0
 # Использует gevent для поддержки WebSocket (совместим с Python 3.12+/3.13)
 
 bind = "127.0.0.1:${APP_PORT}"
@@ -4335,7 +4471,7 @@ echo "    ✓ gunicorn_config.py создан"
 echo "  • Создание systemd сервиса..."
 cat > /etc/systemd/system/$SERVICE.service << SERVEOF
 [Unit]
-Description=TRASSIR Monitor v12.0
+Description=TRASSIR Monitor v13.0
 Documentation=https://github.com/trassir-monitor
 After=network-online.target
 Wants=network-online.target
@@ -4376,7 +4512,7 @@ echo "    ✓ nginx drop-in создан"
 # Nginx конфигурация
 echo "  • Создание конфигурации Nginx..."
 cat > /etc/nginx/sites-available/trassir-monitor << NGINXEOF
-# Nginx конфигурация для TRASSIR Monitor v12.0
+# Nginx конфигурация для TRASSIR Monitor v13.0
 server {
     listen $WEB_PORT default_server;
     listen [::]:$WEB_PORT default_server;
@@ -4589,11 +4725,17 @@ import sqlite3
 from werkzeug.security import generate_password_hash
 
 pw = os.environ["TRASSIR_ADMIN_PASSWORD"]
+poll = os.environ.get("TRASSIR_POLL_INTERVAL", "")
 conn = sqlite3.connect(os.environ["TRASSIR_DB_PATH"], timeout=10)
 conn.execute(
     "INSERT OR REPLACE INTO settings (key, value) VALUES ('admin_password', ?)",
     (generate_password_hash(pw),)
 )
+if poll:
+    conn.execute(
+        "INSERT OR REPLACE INTO settings (key, value) VALUES ('poll_interval', ?)",
+        (poll,)
+    )
 conn.commit()
 conn.close()
 PYSETPWEOF
@@ -4685,39 +4827,56 @@ echo "    ✓ Сервисы запущены"
 sleep 5
 
 # ============================================
-# ПРИМЕНЯЕМ ПАРОЛЬ АДМИНИСТРАТОРА ИЗ ШАГА "ЗАПРОС ПАРАМЕТРОВ"
+# ПРИМЕНЯЕМ ПАРОЛЬ АДМИНИСТРАТОРА И ИНТЕРВАЛ ОПРОСА ИЗ ШАГА "ЗАПРОС ПАРАМЕТРОВ"
 # ============================================
 # app.py — quoted heredoc (см. CLAUDE.md), bash-переменные внутрь него не
 # подставляются, поэтому пароль нельзя было передать через сам исходник.
-# init_db() кладёт в settings.admin_password хеш дефолтного "admin" при
-# самом первом старте сервиса (уже произошло — sleep 5 выше это гарантирует)
-# — здесь просто заменяем эту запись хешем реально введённого пароля тем же
-# способом, каким settings_page()/api_settings() делают это в рантайме.
-# Пароль передаём через переменную окружения, а не подставляем в текст
-# Python — heredoc с 'PYSETPWEOF' в кавычках, никакой интерполяции bash
-# внутри, поэтому спецсимволы в пароле (кавычки, $, обратные слеши) не
-# могут ничего сломать или внедриться в код.
-echo "  • Установка пароля администратора..."
-if TRASSIR_ADMIN_PASSWORD="$ADMIN_PASSWORD" TRASSIR_DB_PATH="$INSTALL_DIR/data/trassir.db" \
-   "$INSTALL_DIR/venv/bin/python3" - <<'PYSETPWEOF'
+# init_db() кладёт в settings.admin_password хеш дефолтного "admin" (и
+# settings.poll_interval="15") при самом первом старте сервиса (уже
+# произошло — sleep 5 выше это гарантирует) — здесь заменяем обе записи
+# реально введёнными значениями тем же способом, каким settings_page()/
+# api_settings() делают это в рантайме. Пароль передаём через переменную
+# окружения, а не подставляем в текст Python — heredoc с 'PYSETPWEOF' в
+# кавычках, никакой интерполяции bash внутри, поэтому спецсимволы в
+# пароле (кавычки, $, обратные слеши) не могут ничего сломать или
+# внедриться в код.
+#
+# Только для свежей установки — на обновлении (IS_UPDATE=1) ADMIN_PASSWORD
+# и POLL не определены (см. "СВЕЖАЯ УСТАНОВКА ИЛИ ОБНОВЛЕНИЕ?" в начале
+# скрипта), а восстановленная на ШАГе 3 БД уже содержит рабочий пароль и
+# интервал — трогать их нечем и незачем.
+if [ "$IS_UPDATE" -eq 0 ]; then
+    echo "  • Установка пароля администратора и интервала опроса..."
+    if TRASSIR_ADMIN_PASSWORD="$ADMIN_PASSWORD" TRASSIR_POLL_INTERVAL="$POLL" \
+       TRASSIR_DB_PATH="$INSTALL_DIR/data/trassir.db" \
+       "$INSTALL_DIR/venv/bin/python3" - <<'PYSETPWEOF'
 import os
 import sqlite3
 from werkzeug.security import generate_password_hash
 
 pw = os.environ["TRASSIR_ADMIN_PASSWORD"]
+poll = os.environ.get("TRASSIR_POLL_INTERVAL", "")
 conn = sqlite3.connect(os.environ["TRASSIR_DB_PATH"], timeout=10)
 conn.execute(
     "INSERT OR REPLACE INTO settings (key, value) VALUES ('admin_password', ?)",
     (generate_password_hash(pw),)
 )
+if poll:
+    conn.execute(
+        "INSERT OR REPLACE INTO settings (key, value) VALUES ('poll_interval', ?)",
+        (poll,)
+    )
 conn.commit()
 conn.close()
 PYSETPWEOF
-then
-    echo "    ✓ Пароль администратора установлен"
+    then
+        echo "    ✓ Пароль администратора и интервал опроса установлены"
+    else
+        echo -e "    ${RED}⚠ Не удалось установить пароль — в системе останется временный пароль 'admin'.${NC}"
+        echo -e "    ${YELLOW}Смените его сразу: sudo trassir-monitor-set-password${NC}"
+    fi
 else
-    echo -e "    ${RED}⚠ Не удалось установить пароль — в системе останется временный пароль 'admin'.${NC}"
-    echo -e "    ${YELLOW}Смените его сразу: sudo trassir-monitor-set-password${NC}"
+    echo "  • Обновление: пароль администратора и интервал опроса сохранены без изменений."
 fi
 
 # ============================================
@@ -4729,9 +4888,19 @@ HTTP=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:$WEB_PORT/ 2>/dev
 echo ""
 echo -e "${GREEN}╔══════════════════════════════════════════════╗${NC}"
 echo -e "${GREEN}║                                              ║${NC}"
-echo -e "${GREEN}║   TRASSIR Monitor v12.0 — УСТАНОВЛЕН!        ║${NC}"
+if [ "$IS_UPDATE" -eq 1 ]; then
+echo -e "${GREEN}║   TRASSIR Monitor v13.0 — ОБНОВЛЁН!          ║${NC}"
+else
+echo -e "${GREEN}║   TRASSIR Monitor v13.0 — УСТАНОВЛЕН!        ║${NC}"
+fi
 echo -e "${GREEN}║                                              ║${NC}"
 echo -e "${GREEN}╚══════════════════════════════════════════════╝${NC}"
+
+if [ ${#_DL_FAILED[@]} -gt 0 ]; then
+    echo ""
+    echo -e "${RED}⚠️  Напоминание: ${#_DL_FAILED[@]} статических файлов так и не скачались${NC}"
+    echo -e "${RED}   (см. предупреждение выше) — часть интерфейса может не работать.${NC}"
+fi
 echo ""
 echo -e "${BOLD}📍 Веб-интерфейс:${NC}"
 echo -e "   ${CYAN}http://${IP}:${WEB_PORT}${NC}"
@@ -4758,7 +4927,11 @@ echo -e "   • Настройка порогов алертов"
 echo ""
 echo -e "${BOLD}🔐 Авторизация:${NC}"
 echo -e "   Войти: ${CYAN}http://${IP}:${WEB_PORT}/login${NC}"
+if [ "$IS_UPDATE" -eq 1 ]; then
+echo -e "   Пароль администратора не менялся (сохранён при обновлении)."
+else
 echo -e "   Пароль администратора уже установлен (введён на шаге настройки)."
+fi
 echo -e "   Сменить позже: ${YELLOW}sudo trassir-monitor-set-password${NC}"
 echo -e "   или в веб-интерфейсе: Настройки → Смена пароля."
 echo ""

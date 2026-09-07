@@ -472,6 +472,214 @@ re-render), new password accepted (302 redirect). Also `bash -n`'d the
 whole installer and `py_compile`'d both copies of the embedded Python
 snippet before committing.
 
+## Offline / air-gapped readiness audit (2026-09-07)
+
+Direct request: confirm the dashboard never depends on the internet at
+runtime (fonts/CSS/JS from a CDN), so it stays usable on an isolated
+network. **Audit result: this was already correctly built** —
+`install-trassir-monitor.sh`'s ШАГ 5 (`_dl()`) already downloads
+Bootstrap CSS/JS, Chart.js, Socket.io, and Bootstrap Icons (CSS +
+`.woff`/`.woff2`) to `$INSTALL_DIR/static/` at install time, and every
+template (`base.html`) references them only via `/static/...` — grepped
+the whole file for `googleapis`/`gstatic`/`cdn.`/bare `https://` inside
+any `<link>`/`<script>` and found nothing outside that one intentional
+`_dl()` block. So the actual gap wasn't in the templates at all — it was
+in what happens when a download fails or when the network genuinely
+isn't there:
+
+1. **`_dl()` silently tolerated a failed download** — printed one
+   `⚠` line and moved on, with nothing loud enough to notice in a long
+   install log. A failed asset meant a permanently broken piece of the
+   UI (no styling, no charts, no icons, no live updates) with no signal
+   pointing at the actual cause. Fixed: failures are now collected in
+   `_DL_FAILED[]` and printed as an unmissable red block at the end of
+   ШАГ 5 *and* repeated in the final install summary, explaining exactly
+   which files are missing and that the dashboard never talks to a CDN
+   on its own — the only fix is re-running the installer with working
+   internet.
+2. **Every reinstall re-downloaded everything unconditionally, even on
+   an update** — meaning "autonomous network" only actually held until
+   the first time someone updated the code, since ШАГ 1 wiped the whole
+   `static/` directory (see the data-loss bug below) and ШАГ 5 always
+   re-fetched from the CDN with no fallback. On a genuinely air-gapped
+   deployment, that update would leave the dashboard with **zero**
+   static assets — no CSS/JS/icons at all, not even the previously
+   working ones. Fixed by making `_dl()` idempotent (skip re-download if
+   `$dest` already exists and is non-empty — see below for how the file
+   gets there across an update) and retrying harder before giving up
+   (`--retry 3 --retry-delay 2`, up from `--retry 2`).
+3. **Correction to point 2, once actually looked into**: `_dl()` being
+   idempotent only helps if the previously-downloaded files survive the
+   `rm -rf $INSTALL_DIR` in ШАГ 1 at all — they didn't (see next
+   section). Both fixes had to land together: preserve `static/` across
+   an update, *and* make `_dl()` skip re-downloading what's already
+   there. Verified with a real network test (`bash -n` alone can't catch
+   this class of bug): `_dl()` correctly (a) reuses an existing non-empty
+   file without touching the network, (b) leaves no partial/empty file
+   behind on a genuine failure (`curl` against a nonexistent domain),
+   and (c) still downloads normally when the file is missing and the
+   network works.
+
+Verdict: the dashboard itself was always offline-safe; the install/update
+*pipeline* around it was the part that could silently break that
+guarantee, and both instances of "how" are fixed now.
+
+## `install-trassir-monitor.sh` destroyed the entire database on every reinstall (found 2026-09-07)
+
+While building the "Update all" launcher feature below, traced what
+actually happens when `install-trassir-monitor.sh` is run a second time
+on a server that already has it installed — and found ШАГ 1
+("ОЧИСТКА СТАРОЙ УСТАНОВКИ") did an unconditional `rm -rf $INSTALL_DIR`
+with **zero** attempt to preserve `data/` first. Every server, history
+row, alert, and the admin password hash lived only inside
+`$INSTALL_DIR/data/trassir.db` — meaning re-running the installer to
+pick up a code update (the *only* way to update code at all, since
+nothing here is a live git checkout — see "Editing means editing the
+heredoc" at the top of this file) silently threw away the entire
+database with no backup, no confirmation prompt, nothing. Compare with
+the *uninstaller*, which does prompt "Сохранить базу данных перед
+удалением?" before its own `rm -rf` — the installer's own reinstall path
+had no equivalent safeguard at all. This was a pre-existing bug, not
+something introduced this session — it just had never been exercised
+carefully before because nothing in this repo previously encouraged
+re-running the full installer against a live system.
+
+**Fixed with a proper update-mode, not a band-aid**: the presence of
+`$INSTALL_DIR/data/trassir.db` is now the single source of truth for
+"is this a fresh install or an update" (`IS_UPDATE`) — not a separate
+flag file that could drift from reality, same principle
+`z2r_autobench`'s own `CLAUDE.md` keeps re-learning the hard way. When
+`IS_UPDATE=1`:
+
+- The interactive prompts (port, poll interval, admin password) are
+  skipped entirely. Port is recovered from a small new metadata file,
+  `$INSTALL_DIR/data/.install_meta` (currently just `WEB_PORT=...`),
+  written on every install/update right after directory creation in
+  ШАГ 3 — deliberately placed *inside* `data/` so it's preserved and
+  restored by the exact same mechanism as the database itself, with no
+  separate persistence path to keep in sync. Falls back to `8080` if the
+  meta file doesn't exist yet (upgrading a pre-fix install for the first
+  time) — a one-time transition cost, documented rather than silently
+  wrong.
+- `data/` (the whole directory — DB, `secret_key.txt`, everything) is
+  copied to a `mktemp -d` location in ШАГ 1 *before* `rm -rf
+  $INSTALL_DIR` runs, then copied back in ШАГ 3 right after the fresh
+  `data/` directory is created. `static/` (see the offline-readiness
+  section above) gets the identical treatment in the same temp
+  directory, for the same "don't lose what doesn't need re-fetching"
+  reason.
+- The post-restart step that used to unconditionally overwrite
+  `settings.admin_password` (see "Admin password now set at install
+  time" below) is now gated on `IS_UPDATE=0` — on an update,
+  `ADMIN_PASSWORD` is simply never set, and skipping this step is what
+  stops it from hashing an empty string over the real, just-restored
+  password.
+- The final banner and the `/login` section of the summary say
+  "ОБНОВЛЁН" vs "УСТАНОВЛЕН" and correctly describe the password as
+  "not changed, preserved" instead of "just set on this run".
+
+**Also fixed in the same pass**: the `POLL` variable (interval prompt)
+was collected from the user but never actually applied anywhere — not
+written to `app.py`, not written to the DB, nothing. `scheduler()` in
+`app.py` reads the real interval from `settings.poll_interval` at
+runtime (defaulting to the `15` `init_db()` seeds), so the prompt was
+pure theater; changing it away from the default had zero effect. Folded
+into the same post-install Python snippet that sets the admin password
+(via a second, optional `TRASSIR_POLL_INTERVAL` env var — empty/unset
+when called from `trassir-monitor-set-password`, so that command
+continues to only ever touch the password, never poll_interval). Added
+basic validation too (`POLL` must be a positive integer, else falls back
+to `15` with a warning) since this is user input that previously went
+nowhere and had never needed validating before.
+
+Verified end-to-end with a scripted simulation (fake `$INSTALL_DIR`,
+real `cp -a`/`rm -rf` calls, no actual apt/pip/systemctl): first run
+detects fresh install, second run against the same directory correctly
+detects update mode, recovers the right port from the meta file, and
+the database + secret key survive the simulated `rm -rf` byte-for-byte.
+Also functionally verified the admin-password-and-poll-interval Python
+snippet against a real SQLite DB: fresh install sets both from the
+install-time values; a `trassir-monitor-set-password`-style call (no
+`TRASSIR_POLL_INTERVAL` in the environment) changes only the password
+hash and leaves `poll_interval` untouched.
+
+## `launcher-trassir-monitor.sh` — single entry point for install/update/uninstall (2026-09-07)
+
+Direct request for one menu covering everything instead of three
+separate `wget`+`bash` commands the user has to remember and re-run by
+hand. Deliberately a thin orchestrator, not a reimplementation — every
+actual install/uninstall action still goes through the existing,
+already-tested `install-trassir-monitor.sh` / `install-telegram-
+notifier.sh` / `install-mail-notifier.sh` / `uninstall-telegram-bot.sh`
+/ `uninstall-mail-notifier.sh`, plus the standalone `trassir-monitor-
+set-password` / `trassir-monitor-uninstall` commands those installers
+generate. This script only decides *what's already installed* and
+*which of those to call* — same "don't duplicate logic that already
+works" principle as everything else added this engagement.
+
+- **Detection is by fact, not by a flag**: `dashboard_installed()`
+  checks for `$INSTALL_DIR/app/app.py` + an executable venv Python;
+  `telegram_installed()`/`email_installed()` check for their bot `.py`
+  file OR their systemd unit (`trassir-tgbot`/`trassir-mailbot`) —
+  mirrors the exact same detection `uninstall-telegram-bot.sh` already
+  uses internally, not a new convention invented for this script.
+- **Menu item 1 (Install Dashboard) cascades into 2/3** exactly as
+  asked: right after a successful install, if Telegram/Email aren't
+  already installed, it asks "Install Telegram/Email notifications
+  now?" instead of making the user come back to the menu and pick items
+  2/3 separately.
+- **Item 5 (Update all) re-runs the installer for every currently-
+  installed component**, always fetching the latest version from GitHub
+  (`force_fresh=1` — see `_get_script()` below) rather than whatever
+  happens to be sitting next to the launcher. The dashboard update is
+  fully safe and non-interactive thanks to the `IS_UPDATE` fix above.
+  Telegram/Email are a different story: their installers still
+  unconditionally re-prompt for bot token/chat IDs/SMTP credentials on
+  every run — no "keep current value" default exists there yet (a
+  real, scoped-out follow-up, not something silently overlooked; see
+  the confirmation text below the "Continue?" prompt for how this is
+  disclosed honestly rather than pretending the update is fully silent).
+- **`_get_script(name, force_fresh)`** resolves a needed script two
+  ways: prefer a same-name file sitting next to the launcher itself
+  (`$SCRIPT_DIR`, works with zero network access for anyone who cloned
+  the whole repo) unless `force_fresh=1`, otherwise download fresh from
+  `raw.githubusercontent.com/scp-oss/TRASSIR-Monitor/main/` into a
+  `mktemp` file — falling back to the local sibling copy (with a loud
+  warning) if the download itself fails, and only erroring out if
+  neither source is available.
+- **Real bug caught during testing, not in review**: the first version
+  tracked "was this a freshly-downloaded temp file, safe to delete
+  afterward" via a global `_LAST_FETCH_WAS_TEMP` flag set inside
+  `_get_script()`. But every caller invokes it as
+  `path=$(_get_script ...)` — command substitution always runs in a
+  subshell, so the assignment to that "global" inside the function was
+  actually happening in the subshell's own copy and silently discarded
+  the moment the subshell exited. `_run_installer()`'s cleanup check
+  was therefore reading whatever `_LAST_FETCH_WAS_TEMP` happened to be
+  left over from a *previous* call — in the worst case, `rm -f`-ing a
+  same-name file sitting right next to the launcher because an earlier,
+  unrelated call happened to set the flag to `1`. Fixed by dropping the
+  flag entirely and comparing the *returned path itself* against
+  `$SCRIPT_DIR/$name` — a value that actually survives the subshell
+  boundary because it comes back through stdout, not a variable
+  assignment. Caught by an actual test that ran a fake local sibling
+  script through `_run_installer()` and confirmed it was still on disk
+  afterward — this would never have shown up from reading the code or
+  from `bash -n` alone, only from exercising the real call path.
+- **Self-installs to `/usr/local/bin/trassir-monitor` on first run**
+  (`cmp`-compare before copying, same idiom `z2r_autobench`'s `z0r`
+  uses for its own generated unit files) — purely a convenience so
+  `sudo trassir-monitor` reopens the menu later without needing to
+  remember where the originally-downloaded file ended up.
+- Verified with a full sandboxed test harness (patched `$INSTALL_DIR`/
+  `$SELF_INSTALL_PATH` into a temp directory, no real system changes):
+  every detection function in both states, the dashboard-required guard
+  on items 2/3/4, item 5 with nothing installed, the uninstall submenu's
+  four options against an empty system, self-install copying the full
+  script correctly, and all three `_get_script()` branches (local
+  reuse, real fresh download, force-fresh ignoring a stale local copy,
+  and the clean-failure path when neither source is reachable).
+
 ## Publishing hygiene
 
 Public repo. Never commit real server hostnames/IPs, ISP/provider names,
