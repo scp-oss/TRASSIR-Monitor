@@ -680,6 +680,78 @@ works" principle as everything else added this engagement.
   reuse, real fresh download, force-fresh ignoring a stale local copy,
   and the clean-failure path when neither source is reachable).
 
+## `uninstall-trassir-monitor.sh` added — launcher's "Uninstall Dashboard" was silently broken (found 2026-09-07)
+
+Live bug report: the launcher's Uninstall submenu had asymmetric
+coverage — standalone `uninstall-telegram-bot.sh` and
+`uninstall-mail-notifier.sh` exist as real files in the repo (download
+and run directly, no prior install needed), but "Uninstall Dashboard"
+only ever called `trassir-monitor-uninstall` via `command -v` — a
+command that only exists if it was already generated onto that specific
+server by a previous `install-trassir-monitor.sh` run. Reported symptom:
+choosing it threw a "file not found or no access" error at what turned
+out to be line 275 of `launcher-trassir-monitor.sh` — the bare
+`trassir-monitor-uninstall` invocation itself, past a `command -v` guard
+that should have prevented ever reaching it if the command were
+genuinely absent. Root cause not fully pinned to one mechanism (could be
+a stale bash command hash, a non-executable leftover from a very old
+install, or a `command -v` match to something outside a hardened `PATH`)
+— but the *design* was fragile regardless of the exact trigger: unlike
+the other two uninstall paths, dashboard removal depended on a
+previously-generated artifact instead of a script this repo actually
+ships and controls.
+
+**Fixed by adding `uninstall-trassir-monitor.sh` as a real, standalone,
+downloadable file** — closing the exact three-way symmetry the report
+asked for (telegram / mail / dashboard, all three now real files with
+identical `wget`+`bash` usage). Structured to match
+`uninstall-telegram-bot.sh`/`uninstall-mail-notifier.sh` exactly
+(detect-by-fact banner, "будет удалено" listing, optional data backup,
+`DELETE`-to-confirm, then the actual removal) rather than inventing a
+new house style for one script.
+
+- **Also removes Telegram/Email if present**, with an explicit warning
+  before the confirmation prompt — they cannot function without the
+  dashboard's venv/`app.py`/DB at all, so leaving their systemd units
+  registered and pointed at now-deleted files would just create two new
+  broken services instead of a clean uninstall. This matches what the
+  launcher's own item 1 description already promised
+  ("Telegram/Email are removed with it — they depend on it") but the
+  old `trassir-monitor-uninstall` path never actually delivered on.
+- **This is intentionally a second copy of the same removal logic**
+  already embedded in `install-trassir-monitor.sh`'s generated
+  `trassir-monitor-uninstall` heredoc — not a wrapper around it, and not
+  a refactor to share one implementation. A wrapper would still depend
+  on the fragile pre-generated command existing at all (the exact
+  problem being fixed); a shared-function approach would need both
+  contexts (a live heredoc inside a much larger installer vs. a fully
+  standalone file) to agree on sourcing conventions that don't currently
+  exist anywhere else in this codebase. Documented here explicitly so a
+  future change to one isn't assumed to auto-propagate to the other —
+  same "two independently-drifting copies" risk this file has flagged
+  before (see the safe-value-passing Python snippet duplicated across
+  the install-time and `trassir-monitor-set-password` call sites) is
+  real here too, just accepted deliberately instead of engineering
+  around it for two ~150-line shell scripts.
+- **`launcher-trassir-monitor.sh`'s Uninstall submenu (items 1 and 4)
+  updated to call `_run_installer "uninstall-trassir-monitor.sh"`**
+  instead of `command -v trassir-monitor-uninstall` — this is the actual
+  fix for the reported error, independent of whatever exactly caused it
+  on that server: `_run_installer` uses the same robust
+  local-sibling-or-fresh-download resolution already proven correct for
+  the telegram/mail uninstall paths, so dashboard removal no longer
+  depends on a previously-generated, potentially stale or missing
+  system command at all.
+- Verified with the same sandboxed-test approach as everything else this
+  engagement: fake `systemctl`/`nginx` binaries prepended to `PATH`, a
+  patched `$INSTALL_DIR` redirected into a temp directory — covered the
+  "nothing installed" fast-exit, the full happy path (services stopped,
+  configs removed, `$INSTALL_DIR` gone), the Telegram/Email-detected
+  warning + their config/DB backup, the cancel-path (typing anything but
+  `DELETE` leaves everything untouched), and a full run of the launcher
+  itself picking up the local sibling copy and completing end-to-end
+  with the menu correctly showing `[false]` for all three afterward.
+
 ## Publishing hygiene
 
 Public repo. Never commit real server hostnames/IPs, ISP/provider names,

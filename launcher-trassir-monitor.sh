@@ -271,8 +271,12 @@ do_uninstall() {
 
     case "$choice" in
         1)
-            if command -v trassir-monitor-uninstall >/dev/null 2>&1; then
-                trassir-monitor-uninstall
+            if dashboard_installed; then
+                # uninstall-trassir-monitor.sh уже само обнаруживает и снимает
+                # Telegram/Email вместе с дашбордом (без него они всё равно
+                # не работают) — отдельно вызывать uninstall-telegram-bot.sh/
+                # uninstall-mail-notifier.sh здесь не нужно.
+                _run_installer "uninstall-trassir-monitor.sh"
             else
                 echo -e "${YELLOW}Dashboard is not installed.${NC}"
             fi
@@ -292,17 +296,19 @@ do_uninstall() {
             fi
             ;;
         4)
-            # Уведомления снимаем ДО дашборда — их анинсталляторы бэкапят
-            # логи/конфиг внутри $INSTALL_DIR, которого после
-            # trassir-monitor-uninstall уже не будет.
+            # Уведомления снимаем ДО дашборда через их собственные
+            # анинсталляторы (более подробные вопросы про очистку БД:
+            # telegram_logs/mail_logs/telegram_chats/mail_recipients) —
+            # к моменту вызова uninstall-trassir-monitor.sh они уже не
+            # обнаружатся и не потребуют повторного подтверждения на них.
             if telegram_installed; then
                 _run_installer "uninstall-telegram-bot.sh"
             fi
             if email_installed; then
                 _run_installer "uninstall-mail-notifier.sh"
             fi
-            if command -v trassir-monitor-uninstall >/dev/null 2>&1; then
-                trassir-monitor-uninstall
+            if dashboard_installed; then
+                _run_installer "uninstall-trassir-monitor.sh"
             fi
             ;;
         0)

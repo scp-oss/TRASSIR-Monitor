@@ -223,11 +223,16 @@ sudo bash uninstall-telegram-bot.sh
 # Удалить Email-демона
 sudo bash uninstall-mail-notifier.sh
 
-# Удалить весь TRASSIR Monitor
+# Удалить весь дашборд (Telegram/Email снимаются вместе с ним — без
+# дашборда они всё равно не могут работать)
+wget https://raw.githubusercontent.com/scp-oss/TRASSIR-Monitor/main/uninstall-trassir-monitor.sh
+sudo bash uninstall-trassir-monitor.sh
+
+# То же самое, если дашборд уже установлен — короткая команда без wget
 sudo trassir-monitor-uninstall
 ```
 
-Деинсталлятор удаляет **только файлы проекта**. Python, Nginx и системные пакеты сохраняются. База данных сохраняется по запросу.
+Деинсталляторы удаляют **только файлы проекта**. Python, Nginx и системные пакеты сохраняются. База данных сохраняется по запросу.
 
 ---
 
@@ -241,6 +246,7 @@ sudo trassir-monitor-uninstall
 | `install-mail-notifier.sh` | Установка Email-уведомлений |
 | `uninstall-telegram-bot.sh` | Удаление Telegram-бота |
 | `uninstall-mail-notifier.sh` | Удаление Email-демона |
+| `uninstall-trassir-monitor.sh` | Удаление всего дашборда (и зависимых Telegram/Email, если установлены) |
 
 ---
 
