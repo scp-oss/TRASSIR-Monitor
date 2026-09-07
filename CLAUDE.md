@@ -894,6 +894,52 @@ recovery — not a coincidental match to the 8080 default; neither present,
 confirming the interactive fallback fires and is clearly labeled) plus a
 full `bash -n`/`py_compile` pass to confirm nothing else was disturbed.
 
+## Root cause of the previous two "bugs": `wget` without `-O` silently kept running stale files (found 2026-09-07)
+
+The user identified this themselves after the two reports above: every
+`wget <url>` in README.md (no `-O`) means re-downloading the same file
+into a directory that already has one from a previous attempt doesn't
+overwrite it — `wget`'s default behavior is to save the new content as
+`launcher-trassir-monitor.sh.1` (then `.2`, etc.) and leave the original
+untouched. `bash launcher-trassir-monitor.sh` then keeps running the
+same original, ever-staler file forever, no matter how many times a
+"fresh" copy is fetched next to it. **This means the "line 275
+uninstall error" and the "no port/password questions on reinstall"
+reports earlier this session may well have been the user testing code
+from days/commits before this session's fixes even existed** — not
+necessarily evidence that those specific fixes were wrong. (The fixes
+themselves were still real and worth having regardless — broadened
+leftover detection and honest port-source labeling are correct
+improvements on their own merits — this just means the original
+reports' evidence value is less certain than it looked at the time.)
+
+**Fixed at the root**: every `wget` command in README.md now passes
+`-O <exact-filename>` explicitly, so a re-download always overwrites
+the same file in place instead of ever creating a numbered duplicate —
+this closes the actual mechanism, not just documents around it. Added
+one explicit callout right after the first `wget` example explaining
+why `-O` matters here specifically (most people don't reach for `-O`
+out of habit since plenty of one-off `wget` usage never hits this).
+
+**Also added a permanent, no-habit-required safety net**: the launcher
+now prints the actual on-disk modification date of the file currently
+executing (`date -r "$(readlink -f "${BASH_SOURCE[0]}")"`) right in the
+menu header — `TRASSIR-Monitor v13.0 (файл от: 2026-09-07 07:27)`.
+Computed once at startup (a `readlink -f` + `date -r` per keystroke
+would be wasteful and pointless — the file isn't changing while the
+menu is open), stored in `_SELF_MTIME`, and referenced from
+`show_menu()` on every redraw. This doesn't depend on remembering to
+bump a hardcoded version string (which rots the moment someone forgets
+to update it) and it's a genuinely stronger signal than "did I use `-O`
+correctly this one time" — it catches *any* stale-file situation, not
+just the `wget`-duplicate-naming one specifically: an old copy kept
+around from a previous session, one shared via a chat client that
+preserved its original download timestamp, a leftover from `git clone`
+at an old commit, anything. If the printed date doesn't match "just
+downloaded a few seconds ago" the moment someone expects a fresh copy
+to be running, that's the tell — no reasoning about `wget` internals
+required.
+
 ## Publishing hygiene
 
 Public repo. Never commit real server hostnames/IPs, ISP/provider names,

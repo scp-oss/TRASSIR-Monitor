@@ -338,12 +338,22 @@ _self_install() {
 }
 _self_install
 
+# Дата изменения ЭТОГО файла на диске — прямой ответ на живой баг
+# 2026-09-07: "wget без -O" на повторной закачке сохранял новый файл как
+# launcher-trassir-monitor.sh.1, не трогая старый, и человек незаметно
+# для себя продолжал запускать давно устаревшую копию, гоняясь за
+# "исправлениями", которые физически не могли до него доехать. README
+# теперь везде использует -O (чинит саму причину), но эта дата в шапке
+# меню — подстраховка на будущее: если она выглядит подозрительно
+# старой сразу после свежего скачивания, значит запущен не тот файл.
+_SELF_MTIME=$(date -r "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")" "+%Y-%m-%d %H:%M" 2>/dev/null || echo "?")
+
 # ============================================
 # ГЛАВНОЕ МЕНЮ
 # ============================================
 show_menu() {
     clear
-    echo -e "${GREEN}${BOLD}TRASSIR-Monitor v13.0${NC}"
+    echo -e "${GREEN}${BOLD}TRASSIR-Monitor v13.0${NC} ${CYAN}(файл от: ${_SELF_MTIME})${NC}"
     echo ""
     printf "%-3s [%-5s] %s\n" "1." "$(_bool dashboard_installed)" "Install Dashboard"
     printf "%-3s [%-5s] %s\n" "2." "$(_bool email_installed)" "Install Email notification"
