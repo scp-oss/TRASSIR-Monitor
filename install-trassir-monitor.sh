@@ -78,9 +78,37 @@ read -p "  Интервал (Enter для 15): " POLL
 POLL=${POLL:-15}
 echo ""
 
+echo -e "  ${BOLD}Пароль администратора${NC}"
+echo -e "  Без входа дашборд можно только просматривать — добавление и"
+echo -e "  удаление серверов, изменение настроек требуют этот пароль."
+echo -e "  Позже сменить прямо на сервере: ${CYAN}sudo trassir-monitor-set-password${NC}"
+echo ""
+while true; do
+    read -p "  Пароль (Enter — сгенерировать случайный): " ADMIN_PASSWORD
+    if [ -z "$ADMIN_PASSWORD" ]; then
+        ADMIN_PASSWORD=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 16)
+        echo -e "  ${GREEN}✓${NC} Сгенерирован пароль: ${BOLD}${ADMIN_PASSWORD}${NC}"
+        echo -e "  ${RED}Запишите его сейчас — второй раз он нигде не покажется.${NC}"
+        break
+    fi
+    if [ ${#ADMIN_PASSWORD} -lt 4 ]; then
+        echo -e "  ${YELLOW}Слишком короткий пароль (минимум 4 символа), попробуйте снова${NC}"
+        continue
+    fi
+    read -p "  Повторите пароль: " ADMIN_PASSWORD_CONFIRM
+    if [ "$ADMIN_PASSWORD" != "$ADMIN_PASSWORD_CONFIRM" ]; then
+        echo -e "  ${RED}Пароли не совпадают, попробуйте снова${NC}"
+        continue
+    fi
+    echo -e "  ${GREEN}✓${NC} Пароль принят"
+    break
+done
+echo ""
+
 echo -e "${GREEN}✅ Параметры установки:${NC}"
 echo -e "   • Порт Web-интерфейса: ${BOLD}$WEB_PORT${NC}"
 echo -e "   • Интервал опроса: ${BOLD}${POLL} секунд${NC}"
+echo -e "   • Пароль администратора: ${BOLD}задан${NC}"
 echo -e "   • Каталог установки: ${BOLD}$INSTALL_DIR${NC}"
 echo ""
 
@@ -4414,6 +4442,15 @@ cat > /usr/local/bin/trassir-monitor-uninstall << 'UNEOF'
 # Удаляет только проект, системные пакеты НЕ трогает
 # ============================================
 
+# Живой баг, найденный 2026-09-06: этот heredoc написан с 'UNEOF' в
+# кавычках — bash-переменные основного install-скрипта сюда НЕ
+# подставляются, они попадают в файл буквально как текст "$INSTALL_DIR".
+# Без этой строки деинсталлятор запускался бы с пустым INSTALL_DIR, и
+# "rm -rf $INSTALL_DIR" ниже превращался бы в "rm -rf" без аргумента —
+# безобидный, но полностью бесполезный no-op: сам деинсталлятор никогда
+# реально не удалял папку проекта.
+INSTALL_DIR="/opt/trassir-monitor"
+
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -4487,6 +4524,9 @@ rm -rf $INSTALL_DIR
 echo "Удаление деинсталлятора..."
 rm -f /usr/local/bin/trassir-monitor-uninstall
 
+echo "Удаление команды смены пароля..."
+rm -f /usr/local/bin/trassir-monitor-set-password
+
 echo ""
 echo -e "${GREEN}╔══════════════════════════════════════════════╗${NC}"
 echo -e "${GREEN}║  TRASSIR Monitor полностью удалён!           ║${NC}"
@@ -4496,6 +4536,79 @@ UNEOF
 
 chmod +x /usr/local/bin/trassir-monitor-uninstall
 echo "    ✓ Деинсталлятор создан: /usr/local/bin/trassir-monitor-uninstall"
+
+# Смена пароля администратора прямо на сервере, без входа в веб-интерфейс
+# (полезно, если пароль забыт и войти в /settings уже нельзя).
+echo "  • Установка команды смены пароля..."
+cat > /usr/local/bin/trassir-monitor-set-password << 'PWCLIEOF'
+#!/bin/bash
+# ============================================
+# Смена пароля администратора TRASSIR Monitor
+# Пишет напрямую в БД — веб-интерфейс не нужен, вход тоже
+# ============================================
+
+INSTALL_DIR="/opt/trassir-monitor"
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
+if [ "$EUID" -ne 0 ]; then
+    echo -e "${RED}Запустите с правами root:${NC}"
+    echo -e "  ${YELLOW}sudo trassir-monitor-set-password${NC}"
+    exit 1
+fi
+
+if [ ! -f "$INSTALL_DIR/data/trassir.db" ]; then
+    echo -e "${RED}База данных не найдена: $INSTALL_DIR/data/trassir.db${NC}"
+    echo "TRASSIR Monitor установлен и хотя бы раз запускался?"
+    exit 1
+fi
+
+echo -e "${YELLOW}Смена пароля администратора TRASSIR Monitor${NC}"
+echo ""
+
+while true; do
+    read -p "  Новый пароль: " NEW_PASSWORD
+    if [ ${#NEW_PASSWORD} -lt 4 ]; then
+        echo -e "  ${YELLOW}Слишком короткий пароль (минимум 4 символа), попробуйте снова${NC}"
+        continue
+    fi
+    read -p "  Повторите пароль: " NEW_PASSWORD_CONFIRM
+    if [ "$NEW_PASSWORD" != "$NEW_PASSWORD_CONFIRM" ]; then
+        echo -e "  ${RED}Пароли не совпадают, попробуйте снова${NC}"
+        continue
+    fi
+    break
+done
+
+if TRASSIR_ADMIN_PASSWORD="$NEW_PASSWORD" TRASSIR_DB_PATH="$INSTALL_DIR/data/trassir.db" \
+   "$INSTALL_DIR/venv/bin/python3" - <<'PYSETPWEOF'
+import os
+import sqlite3
+from werkzeug.security import generate_password_hash
+
+pw = os.environ["TRASSIR_ADMIN_PASSWORD"]
+conn = sqlite3.connect(os.environ["TRASSIR_DB_PATH"], timeout=10)
+conn.execute(
+    "INSERT OR REPLACE INTO settings (key, value) VALUES ('admin_password', ?)",
+    (generate_password_hash(pw),)
+)
+conn.commit()
+conn.close()
+PYSETPWEOF
+then
+    echo ""
+    echo -e "${GREEN}✓ Пароль обновлён.${NC} Действующие сессии в браузере не сбрасываются —"
+    echo "  выйдите и войдите заново, если хотите использовать новый пароль сразу."
+else
+    echo -e "${RED}Не удалось записать пароль в БД.${NC}"
+    exit 1
+fi
+PWCLIEOF
+chmod +x /usr/local/bin/trassir-monitor-set-password
+echo "    ✓ Команда создана: trassir-monitor-set-password"
+
 # Настройка ротации логов
 echo ""
 echo "  • Настройка ротации логов (logrotate)..."
@@ -4572,6 +4685,42 @@ echo "    ✓ Сервисы запущены"
 sleep 5
 
 # ============================================
+# ПРИМЕНЯЕМ ПАРОЛЬ АДМИНИСТРАТОРА ИЗ ШАГА "ЗАПРОС ПАРАМЕТРОВ"
+# ============================================
+# app.py — quoted heredoc (см. CLAUDE.md), bash-переменные внутрь него не
+# подставляются, поэтому пароль нельзя было передать через сам исходник.
+# init_db() кладёт в settings.admin_password хеш дефолтного "admin" при
+# самом первом старте сервиса (уже произошло — sleep 5 выше это гарантирует)
+# — здесь просто заменяем эту запись хешем реально введённого пароля тем же
+# способом, каким settings_page()/api_settings() делают это в рантайме.
+# Пароль передаём через переменную окружения, а не подставляем в текст
+# Python — heredoc с 'PYSETPWEOF' в кавычках, никакой интерполяции bash
+# внутри, поэтому спецсимволы в пароле (кавычки, $, обратные слеши) не
+# могут ничего сломать или внедриться в код.
+echo "  • Установка пароля администратора..."
+if TRASSIR_ADMIN_PASSWORD="$ADMIN_PASSWORD" TRASSIR_DB_PATH="$INSTALL_DIR/data/trassir.db" \
+   "$INSTALL_DIR/venv/bin/python3" - <<'PYSETPWEOF'
+import os
+import sqlite3
+from werkzeug.security import generate_password_hash
+
+pw = os.environ["TRASSIR_ADMIN_PASSWORD"]
+conn = sqlite3.connect(os.environ["TRASSIR_DB_PATH"], timeout=10)
+conn.execute(
+    "INSERT OR REPLACE INTO settings (key, value) VALUES ('admin_password', ?)",
+    (generate_password_hash(pw),)
+)
+conn.commit()
+conn.close()
+PYSETPWEOF
+then
+    echo "    ✓ Пароль администратора установлен"
+else
+    echo -e "    ${RED}⚠ Не удалось установить пароль — в системе останется временный пароль 'admin'.${NC}"
+    echo -e "    ${YELLOW}Смените его сразу: sudo trassir-monitor-set-password${NC}"
+fi
+
+# ============================================
 # ФИНАЛЬНАЯ ПРОВЕРКА
 # ============================================
 IP=$(hostname -I | awk '{print $1}')
@@ -4609,8 +4758,9 @@ echo -e "   • Настройка порогов алертов"
 echo ""
 echo -e "${BOLD}🔐 Авторизация:${NC}"
 echo -e "   Войти: ${CYAN}http://${IP}:${WEB_PORT}/login${NC}"
-echo -e "   Пароль по умолчанию: ${YELLOW}admin${NC}"
-echo -e "   ${RED}⚠ Смените пароль в Настройки → Смена пароля!${NC}"
+echo -e "   Пароль администратора уже установлен (введён на шаге настройки)."
+echo -e "   Сменить позже: ${YELLOW}sudo trassir-monitor-set-password${NC}"
+echo -e "   или в веб-интерфейсе: Настройки → Смена пароля."
 echo ""
 echo -e "   Статус сервиса: ${YELLOW}systemctl status $SERVICE${NC}"
 echo -e "   Просмотр логов: ${YELLOW}journalctl -u $SERVICE -f${NC}"

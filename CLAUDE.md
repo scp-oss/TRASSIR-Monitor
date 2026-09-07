@@ -375,6 +375,103 @@ Also checked for a `requests.Session`-per-poll descriptor leak (each
 cycles showed zero open-fd growth; CPython's refcounting closes each
 session immediately once its `collect()` cycle ends, no accumulation.
 
+## Admin password now set at install time, not hardcoded to "admin" (2026-09-07)
+
+Direct request: the login-gating from the security-audit pass (2026-09-06)
+required a password for changes but still shipped every install with the
+same hardcoded default (`init_db()`'s `generate_password_hash("admin")`,
+still there — see below for why it has to stay). Anyone who read this
+public repo's own source knew every fresh install's password until an
+admin manually visited `/settings` → "Сменить пароль". Fixed by prompting
+for a real password during `install-trassir-monitor.sh` itself, plus a new
+standalone `trassir-monitor-set-password` command for changing it later
+without needing to log in to the web UI at all (useful if the password is
+lost and `/settings` is unreachable specifically because of that).
+
+**Why this can't be done inside `app.py`'s own heredoc.** Every generated
+file in this installer (`app.py`, all 5 templates) is written via
+`cat > $PATH << 'MARKER'` — a **quoted** heredoc delimiter, which disables
+bash variable interpolation entirely so `$`/backtick/etc. in the embedded
+Python/Jinja source is never touched by the shell. That's the correct
+choice for those files (their own source is full of real `$` usage:
+f-strings, shell-unrelated `$`-free Python, Jinja `{{ }}`) but it also
+means `$ADMIN_PASSWORD` typed into that same heredoc would show up in
+`app.py` as the literal four characters `$ADMIN_PASSWORD`, not the actual
+password — the two techniques (quoted heredoc for safe generated-code
+embedding, unquoted heredoc for host-side variable substitution, e.g.
+`gunicorn_config.py`'s `${APP_PORT}`) are mutually exclusive for the same
+heredoc. So `init_db()` still unconditionally seeds the default `"admin"`
+hash on first run — that's fine, because a *separate* step right after the
+service's first `systemctl restart` (once `sleep 5` has given `init_db()`
+time to run) overwrites that row with the hash of whatever the installer
+prompt actually collected.
+
+**How the password crosses the bash → Python boundary safely.** Not
+string-interpolated into Python source at all — passed via an environment
+variable, read back with `os.environ[...]` inside a **quoted** Python
+heredoc (`<<'PYSETPWEOF'`, same principle as `app.py`'s own heredoc, just
+applied to a one-shot script instead of a whole file):
+```bash
+TRASSIR_ADMIN_PASSWORD="$ADMIN_PASSWORD" TRASSIR_DB_PATH="$INSTALL_DIR/data/trassir.db" \
+   "$INSTALL_DIR/venv/bin/python3" - <<'PYSETPWEOF'
+import os, sqlite3
+from werkzeug.security import generate_password_hash
+pw = os.environ["TRASSIR_ADMIN_PASSWORD"]
+conn = sqlite3.connect(os.environ["TRASSIR_DB_PATH"], timeout=10)
+conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('admin_password', ?)",
+             (generate_password_hash(pw),))
+conn.commit(); conn.close()
+PYSETPWEOF
+```
+Neither the outer bash (quoted heredoc, no interpolation) nor the inner
+Python (value read from `os.environ`, never spliced into source text) ever
+treats the password as code — a password containing `'`, `"`, `$`, or a
+backslash can't break out of either layer or inject anything. Verified
+against exactly this with a deliberately hostile test password
+(`S3cret'Pass"With$pecial\Chars`) — round-tripped correctly through both
+the install-time write and a login attempt afterward. Same snippet
+(byte-identical, confirmed via `diff`) is reused for both call sites: the
+one-shot post-install write, and `trassir-monitor-set-password`'s runtime
+change — one place to keep in sync if this logic ever needs to change,
+not two independently-drifting copies (same lesson `z2r_autobench`'s
+`CLAUDE.md` keeps re-learning about detection/path logic copy-pasted
+across files instead of shared).
+
+**`settings.key` is `TEXT PRIMARY KEY`**, so `INSERT OR REPLACE` correctly
+overwrites the single `admin_password` row in place rather than duplicating
+it — confirmed by running the snippet twice in a row with different
+passwords and checking exactly one row exists afterward with only the
+second password verifying.
+
+**Found and fixed in passing while adding the new CLI command**: the
+existing `trassir-monitor-uninstall` script (also a generated, installed
+`/usr/local/bin` binary, same heredoc pattern) referenced `$INSTALL_DIR`
+in `rm -rf $INSTALL_DIR` and the backup `cp -r $INSTALL_DIR/...` lines,
+but never defined that variable **inside its own heredoc body** — it only
+existed in the *installer's* shell scope while the heredoc was being
+written, not in the generated script's scope when someone actually runs
+`trassir-monitor-uninstall` later. Word-splitting turns `rm -rf` (empty,
+unset variable) into a no-op with no error — meaning the "delete
+everything" command had never actually deleted `/opt/trassir-monitor` on
+any install that used it. Fixed by adding `INSTALL_DIR="/opt/trassir-monitor"`
+as the first real line inside that heredoc. `trassir-monitor-set-password`
+is now also removed by the uninstaller (`rm -f
+/usr/local/bin/trassir-monitor-set-password`, alongside its existing
+self-removal line) so uninstall leaves nothing new behind either.
+
+**Full flow verified end-to-end** (mocked, no real server access
+available to this session — same testing approach used throughout this
+engagement): extracted `app.py` from its heredoc, ran `init_db()` against
+a temp SQLite file to get the real default-"admin" hash, ran the exact
+embedded Python snippet via `subprocess` with a hostile test password,
+confirmed via `verify_admin_password()` that the new password verifies
+and the old default no longer does, ran the snippet a second time with a
+different password to confirm no duplicate row, then drove it through a
+real Flask `test_client()` hitting `/login` — old password rejected (200,
+re-render), new password accepted (302 redirect). Also `bash -n`'d the
+whole installer and `py_compile`'d both copies of the embedded Python
+snippet before committing.
+
 ## Publishing hygiene
 
 Public repo. Never commit real server hostnames/IPs, ISP/provider names,
