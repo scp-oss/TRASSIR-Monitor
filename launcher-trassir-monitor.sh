@@ -54,6 +54,26 @@ email_installed() {
 
 _bool() { if "$1" >/dev/null 2>&1; then echo "true"; else echo "false"; fi; }
 
+# Коммит, реально зафиксированный install-*.sh при последней успешной
+# установке/обновлении КОНКРЕТНОГО модуля (dashboard/telegram/mail) —
+# та же метка, которую с этой же правки читает и сам дашборд в футере
+# /settings (см. _read_installed_commit в app.py, CLAUDE.md "Same
+# version/commit footer..."). Это НЕ то же самое, что _LOCAL_COMMIT
+# ниже (тот — про сам файл лаунчера, если он лежит в git-чекауте) —
+# этот отвечает на другой вопрос: "какой коммит реально стоит на
+# сервере для этого модуля", и именно это спрашивали, когда дашборд
+# показывал "коммит: ?" даже после обновления — раньше эта метка
+# нигде не сохранялась вообще, теперь install-*.sh пишет её в конце
+# каждого успешного прогона.
+_read_installed_commit() {
+    local module="$1" path="$INSTALL_DIR/data/.installed_commit_$module"
+    if [ -f "$path" ]; then
+        cat "$path" 2>/dev/null || echo "?"
+    else
+        echo "?"
+    fi
+}
+
 _press_enter() {
     echo ""
     read -p "Press Enter to return to the menu... " _dummy
@@ -371,13 +391,27 @@ _LOCAL_COMMIT=$(_git_short_commit "$SCRIPT_DIR")
 # ============================================
 # ГЛАВНОЕ МЕНЮ
 # ============================================
+# Печатает одну строку пункта 1/2/3: [true/false] + название, и если
+# модуль установлен — реальный установленный коммит рядом (см.
+# _read_installed_commit выше). Ничего не показывает про коммит для
+# неустановленного модуля — "?" рядом с [false] был бы шумом, а не
+# информацией.
+_module_line() {
+    local num="$1" check_fn="$2" label="$3" module="$4" status
+    if "$check_fn" >/dev/null 2>&1; then
+        printf "%-3s [%-5s] %s (коммит: %s)\n" "$num" "true" "$label" "$(_read_installed_commit "$module")"
+    else
+        printf "%-3s [%-5s] %s\n" "$num" "false" "$label"
+    fi
+}
+
 show_menu() {
     clear
     echo -e "${GREEN}${BOLD}TRASSIR-Monitor v13.0${NC} ${CYAN}(файл от: ${_SELF_MTIME}, коммит: ${_LOCAL_COMMIT})${NC}"
     echo ""
-    printf "%-3s [%-5s] %s\n" "1." "$(_bool dashboard_installed)" "Install Dashboard"
-    printf "%-3s [%-5s] %s\n" "2." "$(_bool email_installed)" "Install Email notification"
-    printf "%-3s [%-5s] %s\n" "3." "$(_bool telegram_installed)" "Install Telegram notification"
+    _module_line "1." dashboard_installed "Install Dashboard" "dashboard"
+    _module_line "2." email_installed "Install Email notification" "mail"
+    _module_line "3." telegram_installed "Install Telegram notification" "telegram"
     echo ""
     echo "4.  Change admin passwd"
     echo ""

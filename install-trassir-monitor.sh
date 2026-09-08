@@ -479,7 +479,6 @@ from flask_socketio import SocketIO
 from werkzeug.security import generate_password_hash, check_password_hash
 import requests
 import schedule
-import subprocess
 
 # ============================================
 # КОНФИГУРАЦИЯ ПРИЛОЖЕНИЯ
@@ -497,39 +496,51 @@ APP_VERSION = "v13.0"
 app = Flask(__name__, template_folder=TEMPLATE_DIR)
 
 
+def _read_installed_commit(module):
+    """
+    Читает короткий хеш коммита main, зафиксированный install-*.sh при
+    последней успешной установке/обновлении ЭТОГО конкретного модуля
+    (dashboard/telegram/mail — у каждого своя метка, потому что каждый
+    может обновляться независимо от других). Файл лежит в data/,
+    поэтому переживает обновление (см. "СВЕЖАЯ УСТАНОВКА ИЛИ
+    ОБНОВЛЕНИЕ?" в install-trassir-monitor.sh) — это единственный
+    реальный источник версии в этом проекте: $BASE_DIR НИКОГДА не
+    git-чекаут ни для чего (все install-*.sh пишут файлы напрямую на
+    диск через heredoc, см. CLAUDE.md "Editing means editing the
+    heredoc directly"), так что метка, записанная установщиком через
+    запрос к GitHub API в момент установки — единственный способ узнать
+    это без постоянного живого git-чекаута только ради одной цифры.
+    Отсутствие файла (модуль не установлен, установлен версией до этой
+    правки, или установка проходила без доступа к GitHub) — просто "?",
+    ожидаемый ответ, не ошибка.
+    """
+    path = os.path.join(BASE_DIR, "data", f".installed_commit_{module}")
+    try:
+        with open(path) as f:
+            value = f.read().strip()
+            return value if value else "?"
+    except Exception:
+        return "?"
+
+
 def _get_build_info():
     """
     Информация о версии для футера дашборда/настроек — тот же принцип,
     что уже применён в launcher-trassir-monitor.sh: дата изменения
     САМОГО ФАЙЛА app.py на диске (когда код в последний раз
     сгенерировал установщик — меняется только при реальной установке
-    или обновлении) плюс короткий хеш git-коммита, если $BASE_DIR
-    неожиданно оказался настоящим git-чекаутом. В норме это никогда не
-    так — install-trassir-monitor.sh пишет app.py напрямую на диск через
-    heredoc, а не git clone (см. CLAUDE.md "Editing means editing the
-    heredoc directly") — поэтому честный "?" ожидаем почти всегда, а не
-    повод подделывать номер откуда-то ещё. Считается ОДИН раз при
-    старте процесса (модульная константа BUILD_INFO ниже), а не на
-    каждый запрос — ни то, ни другое не меняется, пока сам процесс жив.
+    или обновлении) плюс коммит, зафиксированный установщиком в
+    data/.installed_commit_dashboard (см. _read_installed_commit).
+    Считается ОДИН раз при старте процесса (модульная константа
+    BUILD_INFO ниже), а не на каждый запрос — ни то, ни другое не
+    меняется, пока сам процесс жив.
     """
     try:
         mtime = datetime.fromtimestamp(os.path.getmtime(__file__)).strftime("%Y-%m-%d %H:%M")
     except Exception:
         mtime = "?"
 
-    commit = "?"
-    if os.path.isdir(os.path.join(BASE_DIR, ".git")):
-        try:
-            result = subprocess.run(
-                ["git", "-C", BASE_DIR, "rev-parse", "--short", "HEAD"],
-                capture_output=True, text=True, timeout=3
-            )
-            if result.returncode == 0:
-                commit = result.stdout.strip()
-        except Exception:
-            pass
-
-    return {"version": APP_VERSION, "mtime": mtime, "commit": commit}
+    return {"version": APP_VERSION, "mtime": mtime, "commit": _read_installed_commit("dashboard")}
 
 
 BUILD_INFO = _get_build_info()
@@ -2193,6 +2204,52 @@ def api_settings():
         conn.commit()
         conn.close()
         return jsonify({"ok": 1, "message": "Настройки сохранены"})
+
+
+@app.route("/api/version/check")
+def check_version():
+    """
+    "Проверить обновления" — сравнивает коммит, зафиксированный при
+    установке/обновлении КАЖДОГО реально установленного модуля (см.
+    _read_installed_commit), с текущим HEAD ветки main на GitHub.
+    Единственный источник правды о "текущей" версии здесь — реальный
+    запрос к GitHub прямо сейчас, а не что-то закешированное: этот
+    проект не хранит нигде отдельно "какая версия сейчас самая
+    новая" — она попросту равна тому, что лежит в main в момент вызова.
+
+    Модуль считается неустановленным (и не попадает в ответ), если для
+    него ещё никогда не фиксировался коммит — то есть либо он реально
+    не установлен, либо установлен версией до появления этой фичи
+    (тогда ответ будет "?" для installed, что тоже показывается как
+    "не удалось определить", а не как "нужно обновление" — путать
+    "не знаем" с "устарело" было бы хуже, чем оставить как есть).
+    """
+    if not session.get("logged_in"):
+        return jsonify({"ok": 0, "error": "Требуется авторизация"}), 403
+
+    try:
+        r = requests.get(
+            "https://api.github.com/repos/scp-oss/TRASSIR-Monitor/commits/main",
+            headers={"Accept": "application/vnd.github+json"},
+            timeout=10
+        )
+        r.raise_for_status()
+        latest_commit = r.json()["sha"][:7]
+    except Exception as e:
+        return jsonify({"ok": 0, "error": f"Не удалось обратиться к GitHub: {e}"}), 502
+
+    modules = {}
+    for module, label in (("dashboard", "Дашборд"), ("telegram", "Telegram"), ("mail", "Email")):
+        installed = _read_installed_commit(module)
+        if installed == "?":
+            continue
+        modules[module] = {
+            "label": label,
+            "installed": installed,
+            "up_to_date": installed == latest_commit
+        }
+
+    return jsonify({"ok": 1, "latest_commit": latest_commit, "modules": modules})
 
 
 @app.route("/api/telegram/chats", methods=["GET", "POST", "PUT", "DELETE"])
@@ -4783,15 +4840,50 @@ async function testMail() {
         '<small style="color:var(--red);">❌ ' + escapeHtml(d.error) + '</small>';
 }
 
+async function checkForUpdates() {
+    var resultDiv = document.getElementById('versionCheckResult');
+    resultDiv.innerHTML = '<span style="color:var(--muted);">Проверка...</span>';
+    try {
+        var r = await fetch('/api/version/check');
+        var d = await r.json();
+        if (!r.ok) {
+            resultDiv.innerHTML = '<span style="color:var(--red);">❌ ' + escapeHtml(d.error || 'Ошибка') + '</span>';
+            return;
+        }
+        var mods = Object.values(d.modules || {});
+        if (mods.length === 0) {
+            resultDiv.innerHTML = '<span style="color:var(--muted);">Не удалось определить версию ни одного модуля ' +
+                '(установлены версией до появления этой проверки — переустановите/обновите через лаунчер, чтобы версия начала фиксироваться)</span>';
+            return;
+        }
+        var lines = mods.map(function(m) {
+            return m.up_to_date
+                ? '✅ ' + escapeHtml(m.label) + ': последняя версия (' + escapeHtml(m.installed) + ')'
+                : '🔄 ' + escapeHtml(m.label) + ': доступно обновление (сейчас ' + escapeHtml(m.installed) + ', актуальный ' + escapeHtml(d.latest_commit) + ')';
+        });
+        resultDiv.innerHTML = lines.join('<br>');
+    } catch (e) {
+        resultDiv.innerHTML = '<span style="color:var(--red);">❌ ' + escapeHtml(e.message) + '</span>';
+    }
+}
+
 // Загружаем статус служб при открытии страницы
 loadServices();
 </script>
 {% endblock %}
 
 {% block footer %}
-<div class="text-center mt-4 mb-3" style="font-size:0.75rem; color:var(--muted);">
+<div class="text-center mt-4 mb-2" style="font-size:0.75rem; color:var(--muted);">
     TRASSIR Monitor {{ build_info.version }} · обновлено: {{ build_info.mtime }}{% if build_info.commit != '?' %} · коммит: {{ build_info.commit }}{% endif %}
 </div>
+{% if logged_in %}
+<div class="text-center mb-4">
+    <button class="btn btn-sm btn-outline-secondary" onclick="checkForUpdates()">
+        <i class="bi bi-arrow-repeat"></i> Проверить обновления
+    </button>
+    <div id="versionCheckResult" class="mt-2" style="font-size:0.85rem;"></div>
+</div>
+{% endif %}
 {% endblock %}
 SETTINGSEOF
 echo "    ✓ settings.html создан ($(wc -c < $INSTALL_DIR/templates/settings.html) байт)"
@@ -5273,6 +5365,39 @@ PYSETPWEOF
     fi
 else
     echo "  • Обновление: пароль администратора и интервал опроса сохранены без изменений."
+fi
+
+# ============================================
+# ФИКСАЦИЯ УСТАНОВЛЕННОГО КОММИТА (для дашборда/settings и проверки обновлений)
+# ============================================
+# У этого проекта на сервере НЕТ git-чекаута ни для чего — все install-*.sh
+# пишут файлы напрямую на диск через heredoc, а не git clone (см. CLAUDE.md
+# "Editing means editing the heredoc directly"). Поэтому единственный
+# способ узнать, какой коммит main реально был применён последним —
+# спросить у самого GitHub прямо сейчас, пока установка/обновление точно
+# идёт с main, и сохранить ответ рядом с БД (data/ — переживает
+# обновления, см. "СВЕЖАЯ УСТАНОВКА ИЛИ ОБНОВЛЕНИЕ?" выше). Выполняется
+# БЕЗУСЛОВНО (не только на свежей установке) — именно "обновление"
+# и есть момент, когда этот файл должен обновиться.
+echo ""
+echo "  • Определение установленной версии (коммит main на GitHub)..."
+LATEST_COMMIT=$(curl -fsSL --connect-timeout 10 --max-time 15 \
+    -H "Accept: application/vnd.github+json" \
+    "https://api.github.com/repos/scp-oss/TRASSIR-Monitor/commits/main" 2>/dev/null | \
+    python3 -c "
+import json, sys
+try:
+    print(json.load(sys.stdin)['sha'][:7])
+except Exception:
+    pass
+" 2>/dev/null)
+
+if [ -n "$LATEST_COMMIT" ]; then
+    echo "$LATEST_COMMIT" > "$INSTALL_DIR/data/.installed_commit_dashboard"
+    echo "    ✓ Версия зафиксирована: $LATEST_COMMIT"
+else
+    echo -e "    ${YELLOW}⚠ Не удалось обратиться к GitHub — версия будет показываться как '?'${NC}"
+    echo -e "    ${YELLOW}(не мешает работе дашборда, только отображению версии/проверке обновлений)${NC}"
 fi
 
 # ============================================

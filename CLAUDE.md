@@ -1213,6 +1213,95 @@ design rather than inventing a different one for the web app.
   commit) correctly reports that repo's real short hash, matching
   `git rev-parse --short HEAD` run independently against the same path.
 
+## Commit always showed "?" even after updating — install-*.sh now stamps a real version marker (2026-09-08)
+
+Live follow-up: after the previous two commits added a version footer
+to the dashboard/settings and a commit hash to the launcher's header,
+the user updated their server and asked why "коммит" still showed `?`.
+The honest answer at the time was correct but useless in practice: the
+`?` was the *documented, expected* result of checking for a `.git`
+directory under `$BASE_DIR`/`$SCRIPT_DIR` — and since this project
+never `git clone`s anything onto a server (every install/uninstall
+script is a single file fetched with `wget`/`curl`, `app.py` is written
+via heredoc), that check was **always** going to return `?`, no matter
+how many times someone updated. The feature was honestly designed
+around a signal (`.git` existing) that this project's own architecture
+guarantees will never be true on a real deployment — technically
+correct, practically pointless for anyone actually trying to answer
+"is my server current."
+
+**Root fix: stop trying to detect a commit from the filesystem, and
+start *recording* it at the one moment it's actually knowable** — right
+when an install/update script is running, because at that instant the
+code just downloaded from `raw.githubusercontent.com/.../main/...` *is*
+whatever `main`'s HEAD currently is. Each of the three installers now
+ends with a step that queries `https://api.github.com/repos/scp-oss/
+TRASSIR-Monitor/commits/main`, extracts the commit `sha` (via the
+venv's own `python3 -c "import json..."` — far more robust than
+grep/sed against JSON, and this project already depends on Python being
+present), and writes the short hash to its own marker file under
+`data/` (survives updates — same directory the DB/`.install_meta`
+already live in): `.installed_commit_dashboard` (from
+`install-trassir-monitor.sh`), `.installed_commit_telegram` (from
+`install-telegram-notifier.sh`), `.installed_commit_mail` (from
+`install-mail-notifier.sh`). **Runs unconditionally on every successful
+run, not gated by `IS_UPDATE`** — the whole point is that "update" is
+exactly the moment this marker needs to change. Network failure during
+this step is handled the same way as everywhere else in these
+installers: prints a clear warning, never fails or blocks the install
+(`set -e` doesn't trip — the `python3` parser always exits 0, silently
+producing empty output on any curl/JSON failure, so a network hiccup at
+this one step degrades to `?` rather than aborting a fully-successful
+install over a cosmetic feature).
+
+- `app.py`'s `_read_installed_commit(module)` (new) just reads the
+  matching marker file — `_get_build_info()`'s `commit` field (shown in
+  the dashboard/settings footer) now comes from this instead of the old
+  `.git`-detection dead end, which was removed entirely (along with the
+  now-unused `subprocess` import).
+- **New `GET /api/version/check`** (login-gated, settings page only —
+  "Проверить обновления" button added to its footer, next to the
+  existing informational version line) — does a **live** GitHub API
+  call to get the CURRENT `main` HEAD and compares it against each
+  installed module's own marker (via the same `_read_installed_commit`)
+  to report, per module, "✅ последняя версия" or "🔄 доступно
+  обновление (сейчас X, актуальный Y)". A module with no marker file at
+  all (never installed, or installed by a version predating this
+  feature) is simply omitted from the result — never reported as
+  "needs an update" when the honest answer is "we don't know," matching
+  this project's established principle (see the camera-recovery
+  section above) of never guessing when silence is the safer answer.
+  This is the "version is the same → say latest" behavior the follow-up
+  request asked for: it's driven by exact **commit** equality, not by
+  the `APP_VERSION` string (`"v13.0"`), which isn't bumped on every
+  commit — a functionally-current install correctly reports "up to
+  date" via its commit even while `APP_VERSION` stays unchanged.
+- **The launcher gets the exact same fix**, not a separate one: its
+  menu now shows each installed module's real commit next to its
+  `[true]` status (`1.  [true ] Install Dashboard (коммит: d23ecdf)`) by
+  reading the identical `data/.installed_commit_<module>` marker files
+  — this is a genuinely different question from the launcher's
+  pre-existing `_LOCAL_COMMIT` (which is about the launcher *script's
+  own* source, only meaningful if someone `git clone`d the whole repo
+  instead of `wget`-ing one file) — that check is kept as-is for its own
+  narrow purpose; this is a second, independent display answering "what
+  commit is actually deployed on this server," which is what the report
+  was really asking about all along.
+- Verified: the real shell pipeline (`curl | python3 -c ...`) against
+  the live GitHub API correctly returns the current short SHA and
+  correctly degrades to empty output (not a crash, not a `set -e`
+  abort) when pointed at an unreachable host. `_get_build_info()`/
+  `_read_installed_commit()`/`/api/version/check()` covered end-to-end
+  with `test_client()`: rejects without login; reports a module
+  up-to-date when its marker matches the (mocked) latest SHA and behind
+  when it doesn't; correctly omits a module with no marker at all;
+  returns a clean 502 (not a 500) when the GitHub call itself fails;
+  settings page shows the "Проверить обновления" button only when
+  logged in. Launcher side verified in a sandboxed run: two modules
+  with marker files present each show their own distinct commit next to
+  `[true]`, the third (no marker, not installed) shows plain `[false]`
+  with nothing extra.
+
 ## Publishing hygiene
 
 Public repo. Never commit real server hostnames/IPs, ISP/provider names,

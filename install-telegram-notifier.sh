@@ -1199,6 +1199,34 @@ case "$TEST_RESULT" in
 esac
 
 # ============================================
+# ФИКСАЦИЯ УСТАНОВЛЕННОГО КОММИТА (для дашборда/settings и проверки обновлений)
+# ============================================
+# Тот же приём, что и в install-trassir-monitor.sh — этот проект не
+# использует git clone ни для чего на сервере, поэтому единственный
+# способ узнать, какой коммит main реально был применён — спросить у
+# GitHub прямо сейчас и сохранить рядом с БД (data/ общий с дашбордом,
+# переживает переустановки бота отдельно от дашборда).
+echo ""
+echo "  • Определение установленной версии (коммит main на GitHub)..."
+LATEST_COMMIT=$(curl -fsSL --connect-timeout 10 --max-time 15 \
+    -H "Accept: application/vnd.github+json" \
+    "https://api.github.com/repos/scp-oss/TRASSIR-Monitor/commits/main" 2>/dev/null | \
+    "$VENV_PYTHON" -c "
+import json, sys
+try:
+    print(json.load(sys.stdin)['sha'][:7])
+except Exception:
+    pass
+" 2>/dev/null)
+
+if [ -n "$LATEST_COMMIT" ]; then
+    echo "$LATEST_COMMIT" > "$INSTALL_DIR/data/.installed_commit_telegram"
+    echo "    ✓ Версия зафиксирована: $LATEST_COMMIT"
+else
+    echo -e "    ${YELLOW}⚠ Не удалось обратиться к GitHub — версия будет показываться как '?'${NC}"
+fi
+
+# ============================================
 # ФИНАЛЬНЫЙ ВЫВОД
 # ============================================
 IP=$(hostname -I | awk '{print $1}')
