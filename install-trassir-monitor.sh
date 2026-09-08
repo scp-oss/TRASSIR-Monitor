@@ -962,7 +962,27 @@ class TrassirClient:
             print(f"  Найдено каналов: {len(channels_list)}")
             
             # Шаг 3: для каждого канала запрашиваем его состояние
+            #
+            # channels_status — словарь {имя_канала: bool}, а alerts.msg
+            # хранит именно ИМЯ, не guid, так что если в TRASSIR у двух
+            # разных каналов совпадает имя (это ничем не запрещено на
+            # уровне SDK), их статусы здесь схлопываются в один ключ.
+            # Живая жалоба "камера восстановилась, а алерт не закрывается"
+            # с высокой вероятностью — ровно этот случай: например, канал
+            # с именем "Двор" удалили и создали заново под тем же именем,
+            # или две камеры изначально называются одинаково. Без явной
+            # обработки последний обработанный канал в JSON-ответе молча
+            # перезаписывал бы статус предыдущего одноимённого — то есть
+            # "онлайн" одного мог случайно скрыть "офлайн" другого (и
+            # алерт закрылся бы неправильно, когда камера, о которой он
+            # реально был, всё ещё не работает) — либо наоборот, "офлайн"
+            # мог держать алерт открытым даже когда РЕАЛЬНАЯ камера,
+            # создавшая алерт, уже восстановилась. Схлопываем консервативно
+            # через AND — "онлайн" только если ВСЕ одноимённые каналы
+            # онлайн — так алерт никогда не закроется по ошибке, только,
+            # в худшем случае, откроется чуть дольше, чем нужно.
             channels_status = {}
+            duplicate_names_warned = set()
             for i, ch in enumerate(channels_list):
                 try:
                     ch_response = self.session.get(
@@ -970,22 +990,32 @@ class TrassirClient:
                         params=params,
                         timeout=5
                     )
-                    
+
                     if ch_response.status_code == 200:
                         ch_data = json.loads(ch_response.text)
                         state_vector = ch_data.get("state_vector", [])
                         is_online = "Signal" in state_vector
-                        channels_status[ch["name"]] = is_online
                     else:
-                        channels_status[ch["name"]] = False
+                        is_online = False
                 except Exception as e:
-                    channels_status[ch["name"]] = False
+                    is_online = False
                     print(f"  ⚠ Ошибка для канала {ch['name']}: {e}")
-                
+
+                name = ch["name"]
+                if name in channels_status:
+                    if name not in duplicate_names_warned:
+                        duplicate_names_warned.add(name)
+                        print(f"  ⚠ Несколько каналов с именем '{name}' в TRASSIR — "
+                              f"алерты по камерам сопоставляются по ИМЕНИ, поэтому статус "
+                              f"объединён как 'онлайн, только если все одноимённые каналы онлайн'")
+                    channels_status[name] = channels_status[name] and is_online
+                else:
+                    channels_status[name] = is_online
+
                 # Выводим прогресс для большого количества каналов
                 if (i + 1) % 10 == 0:
                     print(f"  Проверено {i + 1}/{len(channels_list)} каналов...")
-            
+
             return {"ok": 1, "channels": channels_status}
         
         except Exception as e:
@@ -1150,8 +1180,22 @@ def collect():
                     for alert in active_cam_alerts:
                         # Извлекаем имя камеры из сообщения "Камера офлайн: CamName"
                         cam_name = alert["msg"].replace("Камера офлайн: ", "").strip()
-                        # Если камера теперь онлайн — закрываем алерт
-                        if all_channels.get(cam_name, False):
+                        # Сопоставление идёт по ИМЕНИ канала (в alerts.msg не
+                        # хранится guid) — если канал переименован/удалён в
+                        # TRASSIR, автоматика не может отличить "уже
+                        # восстановился" от "больше не существует под этим
+                        # именем" и намеренно НЕ закрывает алерт сама (тихое
+                        # автозакрытие в этом случае рискованнее, чем алерт,
+                        # который придётся закрыть вручную через "Сбросить" —
+                        # см. новую кнопку у каждого алерта в server.html).
+                        # Печатаем явно, чтобы при живой жалобе "камера
+                        # восстановилась, а алерт висит" сразу было видно,
+                        # какая именно из двух причин это в конкретном случае.
+                        if cam_name not in all_channels:
+                            print(f"  ⚠ {server_name}: алерт «Камера офлайн: {cam_name}» не закрыт — "
+                                  f"канала с таким именем сейчас нет в списке TRASSIR "
+                                  f"(переименован или удалён?), сбросить вручную кнопкой у алерта")
+                        elif all_channels.get(cam_name, False):
                             conn.execute(
                                 "UPDATE alerts SET ack = 1, resolved_at = datetime('now', '+3 hours') WHERE id = ?",
                                 (alert["id"],)
@@ -1897,6 +1941,33 @@ def acknowledge_alerts(server_id):
     conn.close()
     
     return jsonify({"ok": 1, "message": "Алерты подтверждены"})
+
+
+@app.route("/api/alerts/<int:alert_id>/dismiss", methods=["POST"])
+def dismiss_alert(alert_id):
+    """
+    API: подтвердить (сбросить) ОДИН конкретный алерт по его id.
+
+    Раньше единственным способом закрыть алерт вручную было "Сбросить
+    все" для всего сервера — если один конкретный алерт не закрывается
+    автоматически (например, камера была переименована/удалена в
+    TRASSIR и её больше нет в списке под старым именем, поэтому автомат
+    не может сопоставить "восстановилась" с "не существует"), сброс
+    только его означал попутно сбросить и все остальные, ещё
+    действительно активные проблемы того же сервера.
+    """
+    if not session.get("logged_in"):
+        return jsonify({"ok": 0, "error": "Требуется авторизация"}), 403
+
+    conn = get_db()
+    conn.execute(
+        "UPDATE alerts SET ack = 1, resolved_at = datetime('now', '+3 hours') WHERE id = ? AND ack = 0",
+        (alert_id,)
+    )
+    conn.commit()
+    conn.close()
+
+    return jsonify({"ok": 1, "message": "Алерт подтверждён"})
 
 
 @app.route("/api/settings", methods=["GET", "POST"])
@@ -3506,7 +3577,14 @@ cat > $INSTALL_DIR/templates/server.html << 'SERVEREOF'
                             </strong>
                             <span class="badge bg-dark">{{ alert.ts }}</span>
                         </div>
-                        <div>{{ alert.msg }}</div>
+                        <div class="d-flex justify-content-between align-items-end gap-2">
+                            <div>{{ alert.msg }}</div>
+                            {% if logged_in %}
+                            <button class="btn btn-sm btn-outline-secondary flex-shrink-0" onclick="dismissAlert({{ alert.id }})" title="Сбросить только этот алерт">
+                                <i class="bi bi-x-lg"></i>
+                            </button>
+                            {% endif %}
+                        </div>
                     </div>
                     {% endfor %}
                 {% else %}
@@ -3683,6 +3761,13 @@ function refreshMetrics() {
 // ============================================
 function acknowledgeAlerts() {
     fetch('/api/ack/{{ server.id }}', { method: 'POST' })
+        .then(function() {
+            location.reload();
+        });
+}
+
+function dismissAlert(alertId) {
+    fetch('/api/alerts/' + alertId + '/dismiss', { method: 'POST' })
         .then(function() {
             location.reload();
         });

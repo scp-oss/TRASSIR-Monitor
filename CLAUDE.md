@@ -940,6 +940,87 @@ downloaded a few seconds ago" the moment someone expects a fresh copy
 to be running, that's the tell — no reasoning about `wget` internals
 required.
 
+## "Camera recovered but alert stays open" — audited, one real bug fixed, two more made self-diagnosing (2026-09-08)
+
+Live report: a camera came back online but its "Камера офлайн" alert
+never auto-closed. No live server access to reproduce directly, so this
+was investigated by re-reading the whole camera alert lifecycle in
+`app.py` (`collect()`'s recovery block + `TrassirClient.get_channels_info()`)
+and simulating every branch with fake `TrassirClient`s against a real
+temp SQLite DB — same testing approach used throughout this engagement.
+
+**The straightforward case works correctly** — confirmed by simulation:
+camera goes offline → alert created; camera comes back online (either
+via `channels_info` matching it online by name, or via the `health.ch_o
+== health.ch_t` fallback when `channels_info` itself couldn't be
+fetched) → alert's `ack`/`resolved_at` get set correctly on the very
+next poll. So the recovery *mechanism* itself isn't broken in the
+general case — the bug had to be in one of the ways this specific
+name-based matching can go wrong.
+
+**Found one real, provable bug**: alerts are matched to cameras purely
+by NAME (`alerts.msg` stores `"Камера офлайн: <name>"`, no GUID —
+`get_channels_info()` only ever returns `{name: bool}`). Nothing in
+TRASSIR's SDK guarantees channel names are unique, and
+`get_channels_info()` built `channels_status` with a plain
+`channels_status[ch["name"]] = is_online` inside the per-channel loop —
+if two channels ever share a name (a channel deleted and recreated
+under the same name, two cameras just named the same thing, a common
+real-world NVR pattern), whichever channel happened to be processed
+LAST in that poll's `/objects/` response silently overwrote the
+other's status in the dict. Proven with a synthetic test (two channels
+both named "Dvor", one online + one offline): before the fix, the
+final status for "Dvor" was whichever one the loop iterated last,
+independent of which specific camera's alert was actually open —
+meaning a still-broken camera's alert could get closed while its
+actually-recovered same-named sibling stays marked offline, or vice
+versa, unpredictably from run to run.
+
+Fixed by combining same-named entries with a conservative AND —
+`channels_status[name] = channels_status[name] and is_online` when a
+name repeats — so a name is only ever reported "online" once **every**
+channel sharing it is genuinely online. This can never close an alert
+early (the failure mode that would silently hide a real outage); worst
+case it keeps a technically-recovered alert open a bit longer, which is
+the safe direction to be wrong in. Also logs the very first time a
+duplicate name is seen in a poll, so if this is happening on a real
+server it's now visible in `collect.log` instead of a silent dict
+collision. Verified both directions: one-of-two-online correctly stays
+`False`; once both flip online it correctly becomes `True`.
+
+**The second real possibility — a channel that was renamed or deleted
+in TRASSIR** — can't be "fixed" the same way, because there's a
+genuine ambiguity the code cannot resolve on its own: if `cam_name`
+from an open alert no longer appears under that name in the current
+channel list at all, there is no way to distinguish "it recovered and
+also got renamed" from "it was deleted and something unrelated now
+happens to occupy that slot" from "it's still broken and TRASSIR just
+stopped reporting it under the old name." Silently auto-closing here
+would risk hiding a real, still-ongoing outage — worse than what was
+reported. Instead of guessing, this case now logs exactly what
+happened (`алерт «Камера офлайн: X» не закрыт — канала с таким именем
+сейчас нет в списке TRASSIR`) so a live recurrence is immediately
+diagnosable instead of a silent "why won't this go away," and:
+
+**Added the actual missing remediation path**: there was no way to
+dismiss ONE specific alert without hitting "Сбросить все" for the
+entire server (`/api/ack/<server_id>`), which also clears every other
+still-genuinely-active problem on that server just to get rid of one
+stuck outlier. New `POST /api/alerts/<alert_id>/dismiss` (same
+login-gating pattern as the existing ack endpoint) + a small ✕ button
+next to each active alert in `server.html`, wired to a new
+`dismissAlert(id)` JS function mirroring the existing
+`acknowledgeAlerts()`. Verified end-to-end via Flask `test_client()`:
+rejected without a session, succeeds when logged in, and — the part
+that actually matters here — dismissing one alert leaves every other
+open alert on the same server untouched.
+
+Net result: the demonstrable bug (duplicate channel names) is fixed;
+the fundamentally-ambiguous case (renamed/deleted channel) is made
+loudly diagnosable instead of silently confusing, with an immediate
+manual escape hatch that doesn't require nuking every other alert on
+the server to use.
+
 ## Publishing hygiene
 
 Public repo. Never commit real server hostnames/IPs, ISP/provider names,
