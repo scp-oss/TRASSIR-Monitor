@@ -348,12 +348,32 @@ _self_install
 # старой сразу после свежего скачивания, значит запущен не тот файл.
 _SELF_MTIME=$(date -r "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")" "+%Y-%m-%d %H:%M" 2>/dev/null || echo "?")
 
+# Короткий хеш текущего коммита — работает только если лаунчер запущен
+# из настоящего git-чекаута этого репозитория ($SCRIPT_DIR/.git
+# существует), то есть человек склонировал весь репозиторий, а не
+# просто скачал один файл через wget (обычный способ распространения
+# этого проекта, см. README). Ни этот файл, ни $INSTALL_DIR на реальном
+# сервере никогда не бывают git-чекаутом — установщики просто пишут
+# сгенерированные файлы на диск, .git там взяться неоткуда (см. "Editing
+# means editing the heredoc directly" в CLAUDE.md) — так что честный "?"
+# в этом обычном случае ожидаем, а не баг, и не повод подделывать номер
+# версии откуда-то ещё.
+_git_short_commit() {
+    local dir="$1"
+    if [ -d "$dir/.git" ]; then
+        git -C "$dir" rev-parse --short HEAD 2>/dev/null || echo "?"
+    else
+        echo "?"
+    fi
+}
+_LOCAL_COMMIT=$(_git_short_commit "$SCRIPT_DIR")
+
 # ============================================
 # ГЛАВНОЕ МЕНЮ
 # ============================================
 show_menu() {
     clear
-    echo -e "${GREEN}${BOLD}TRASSIR-Monitor v13.0${NC} ${CYAN}(файл от: ${_SELF_MTIME})${NC}"
+    echo -e "${GREEN}${BOLD}TRASSIR-Monitor v13.0${NC} ${CYAN}(файл от: ${_SELF_MTIME}, коммит: ${_LOCAL_COMMIT})${NC}"
     echo ""
     printf "%-3s [%-5s] %s\n" "1." "$(_bool dashboard_installed)" "Install Dashboard"
     printf "%-3s [%-5s] %s\n" "2." "$(_bool email_installed)" "Install Email notification"

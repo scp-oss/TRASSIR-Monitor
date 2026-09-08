@@ -1127,6 +1127,46 @@ servers instead of the one-at-a-time modal form.
   reimporting the same export is safely idempotent and doesn't
   duplicate anything.
 
+## Launcher shows the local git commit hash next to the file date (2026-09-08)
+
+Direct request: add the current commit's version to the launcher, next
+to the file-mtime freshness indicator added the day before (see "Root
+cause of the previous two 'bugs': `wget` without `-O`" above).
+
+Unlike `z2r_autobench`'s `z0r`/`z0r-panel` (which show a live "текущий
+коммит" via `git rev-parse --short HEAD` against a real checkout — those
+projects install by `git clone`, so `.git` genuinely exists on the
+server), **this project has no git checkout on a deployed server at
+all** — every install/uninstall/launcher script here is a single file
+fetched with `wget`/`curl`, and `install-trassir-monitor.sh` writes
+`app.py`/the templates straight to disk via heredocs, never `git
+clone`s anything (see "Editing means editing the heredoc directly" at
+the top of this file). So a hardcoded commit SHA baked into the
+launcher's own text was never an option — the commit that adds a
+string is finalized *after* the string's content is written, so a
+script can't correctly self-reference its own resulting hash without
+special build tooling this project deliberately doesn't have.
+
+**Solved without any self-reference problem**: `_git_short_commit(dir)`
+checks whether `$dir/.git` exists — true only when the launcher happens
+to be sitting inside an actual `git clone` of this repo (someone cloned
+the whole thing instead of `wget`-ing the one file, which the README's
+"Быстрая установка" recommends but doesn't require) — and if so, runs
+`git -C "$dir" rev-parse --short HEAD`. Called once at startup with
+`$SCRIPT_DIR`, result cached in `_LOCAL_COMMIT`, shown in the menu
+header next to the existing `_SELF_MTIME`: `TRASSIR-Monitor v13.0 (файл
+от: 2026-09-08 10:04, коммит: 43a0631)`. When there's no `.git` (the
+overwhelmingly common case for how this project is actually
+distributed), it correctly and honestly prints `?` — this is the
+expected, correct answer for that case, not a bug to chase or a reason
+to fake a version number from somewhere else.
+
+Verified both branches directly: copied the launcher into a real clone
+of this repo and confirmed the displayed hash matches `git rev-parse
+--short HEAD` run independently in that same clone; copied it into a
+bare directory with no `.git` at all and confirmed it prints `?` rather
+than crashing or hanging on the `git` call.
+
 ## Publishing hygiene
 
 Public repo. Never commit real server hostnames/IPs, ISP/provider names,
