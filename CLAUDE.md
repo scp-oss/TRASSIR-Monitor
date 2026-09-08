@@ -1068,6 +1068,65 @@ subsequent poll (pointing at a persistent connectivity/API problem
 worth investigating separately) versus appearing once or twice before
 alerts start closing normally (the expected, harmless transient case).
 
+## Export/import registrators (2026-09-08)
+
+Direct request: an admin-only way to export the server list (name, IP,
+port, SSL flag, SDK password) to a file and re-import it — for backup
+before a reinstall, migrating to a new monitor host, or bulk-adding
+servers instead of the one-at-a-time modal form.
+
+- **`GET /api/servers/export`** — login-gated (unlike the existing
+  `GET /api/servers`, which deliberately never returns the real
+  password, only `has_password: true/false` — see the "SDK-пароли
+  серверов TRASSIR никогда не отдаются" note in this file's security
+  section). This new endpoint intentionally DOES return the real
+  `sdk_password` in plaintext, because an export that can't be used to
+  actually restore the servers on another install would be pointless.
+  Since this reveals secrets rather than just changing state, it's
+  gated the same way any write endpoint already is
+  (`session.get("logged_in")` check, 403 otherwise) — read-vs-write
+  isn't the right axis to gate on when the read itself is sensitive.
+  Returns a `Content-Disposition: attachment` JSON file
+  (`trassir-monitor-servers-<timestamp>.json`); `id`/`created_at` are
+  deliberately excluded from the export — they're internal to one
+  specific SQLite file and meaningless (or actively colliding) on
+  another install or after a fresh reinstall of the same one.
+- **`POST /api/servers/import`** — same login gate. Matches incoming
+  rows to existing servers **by name** (the only value that's both
+  human-visible and portable across installs — `id` isn't). A name
+  match updates the row; no match inserts a new one. An empty
+  `sdk_password` in an imported row does **not** overwrite an existing
+  saved password — mirrors the exact same "blank field = keep current
+  value" convention `PUT /api/servers` already uses, so a file that's
+  been hand-edited (or had passwords deliberately stripped before
+  sharing it with someone who should see server names but not
+  credentials) doesn't silently wipe real passwords on re-import.
+  Defensive parsing throughout: rejects non-JSON, rejects a non-array
+  body, caps at 500 rows, and validates each row independently —
+  a malformed row is reported in an `errors` array and skipped rather
+  than aborting the whole import or crashing.
+- UI lives in a new card on `/settings` right below the existing server
+  list, `{% if logged_in %}`-gated like everything else that mutates or
+  reveals server config. Export is a plain `<a href=... download>` —
+  no JS needed, the browser's native download handles a same-origin,
+  cookie-authenticated GET correctly on its own; import reads the
+  chosen file client-side with `File.text()`, JSON-parses it, and POSTs
+  the parsed array — same `escapeHtml()`-on-every-server-supplied-string
+  convention as the rest of this page for rendering the result message
+  (added/updated counts, any per-row errors).
+- Verified with Flask `test_client()`: both endpoints reject without a
+  session; export includes the real password and both test servers;
+  import in one call updates an existing server (confirmed the blank
+  password in the import row did NOT clobber the real stored one),
+  adds a new one, and reports exactly one error for a deliberately
+  invalid row (missing name); malformed-JSON and non-array bodies both
+  return a clean 400 instead of a 500. Also verified the actual round
+  trip end to end — export five servers, feed that exact file straight
+  back into import — reports `added: 0, updated: 5`, and the resulting
+  table still has exactly five rows with all fields unchanged, so
+  reimporting the same export is safely idempotent and doesn't
+  duplicate anything.
+
 ## Publishing hygiene
 
 Public repo. Never commit real server hostnames/IPs, ISP/provider names,

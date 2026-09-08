@@ -473,7 +473,7 @@ import secrets
 import hmac
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
-from flask import Flask, jsonify, render_template, request, session, redirect, url_for
+from flask import Flask, jsonify, render_template, request, session, redirect, url_for, make_response
 from flask_cors import CORS
 from flask_socketio import SocketIO
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -1937,6 +1937,132 @@ def api_servers():
         
         conn.close()
         return jsonify({"ok": 1, "message": "Сервер удалён"})
+
+
+@app.route("/api/servers/export")
+def export_servers():
+    """
+    Экспорт списка серверов ВМЕСТЕ с SDK-паролями — для резервной копии
+    или переноса на другую установку. Обычный GET /api/servers никогда
+    не отдаёт реальный пароль (только has_password: true/false) — здесь
+    пароль отдаётся намеренно, иначе импорт на другой установке был бы
+    бесполезен (пароли пришлось бы вбивать заново вручную для каждого
+    сервера). Именно поэтому этот READ-эндпоинт, в отличие от обычного
+    чтения списка серверов, всё равно требует авторизации — как любое
+    действие, раскрывающее секреты.
+    """
+    if not session.get("logged_in"):
+        return jsonify({"ok": 0, "error": "Требуется авторизация"}), 403
+
+    conn = get_db()
+    servers = conn.execute(
+        "SELECT name, ip, port, sdk_password, ssl, enabled FROM servers ORDER BY name"
+    ).fetchall()
+    conn.close()
+
+    # id и created_at намеренно не экспортируются — это внутренние
+    # значения конкретной установки, при импорте на другую (или в ту же
+    # после повторного экспорта) они всё равно не имеют смысла;
+    # сопоставление при импорте идёт по имени сервера, единственному
+    # человекочитаемому и переносимому идентификатору.
+    data = [dict(s) for s in servers]
+    payload = json.dumps(data, ensure_ascii=False, indent=2)
+
+    response = make_response(payload)
+    response.headers["Content-Type"] = "application/json; charset=utf-8"
+    response.headers["Content-Disposition"] = (
+        "attachment; filename=trassir-monitor-servers-"
+        + datetime.now().strftime("%Y%m%d_%H%M%S") + ".json"
+    )
+    return response
+
+
+@app.route("/api/servers/import", methods=["POST"])
+def import_servers():
+    """
+    Импорт серверов из файла в формате /api/servers/export (или
+    составленного вручную по тому же образцу).
+
+    Сопоставление с уже существующими серверами — по НАЗВАНИЮ: оно
+    единственное человекочитаемое и не завязано на id конкретной БД
+    (id новой установки неизбежно не совпадут со старыми). Совпало имя —
+    обновляем запись, не совпало — добавляем новую. Пустой sdk_password
+    в импортируемой записи не затирает уже сохранённый пароль — та же
+    логика "пустое поле = оставить как есть", что и в обычном
+    PUT /api/servers, на случай если файл экспорта отредактировали
+    вручную и забыли про пароль (или намеренно вычистили его перед
+    тем, как поделиться файлом с кем-то ещё).
+    """
+    if not session.get("logged_in"):
+        return jsonify({"ok": 0, "error": "Требуется авторизация"}), 403
+
+    try:
+        data = request.get_json(force=True, silent=False)
+    except Exception:
+        return jsonify({"ok": 0, "error": "Не удалось разобрать JSON"}), 400
+
+    if not isinstance(data, list):
+        return jsonify({"ok": 0, "error": "Ожидался список серверов (JSON-массив)"}), 400
+
+    if len(data) > 500:
+        return jsonify({"ok": 0, "error": "Слишком много записей за один импорт (максимум 500)"}), 400
+
+    conn = get_db()
+    added = 0
+    updated = 0
+    errors = []
+
+    for i, entry in enumerate(data):
+        if not isinstance(entry, dict):
+            errors.append(f"Запись {i + 1}: не объект")
+            continue
+
+        name = str(entry.get("name", "")).strip()
+        ip = str(entry.get("ip", "")).strip()
+        if not name or not ip:
+            errors.append(f"Запись {i + 1}: не указано название или IP")
+            continue
+
+        try:
+            port = int(entry.get("port", 8080))
+        except (TypeError, ValueError):
+            errors.append(f"Запись {i + 1} ({name}): некорректный порт")
+            continue
+
+        ssl_val = bool(entry.get("ssl", True))
+        enabled_val = bool(entry.get("enabled", True))
+        sdk_password = str(entry.get("sdk_password") or "")
+
+        existing = conn.execute(
+            "SELECT id FROM servers WHERE name = ?", (name,)
+        ).fetchone()
+
+        if existing:
+            if sdk_password:
+                conn.execute(
+                    "UPDATE servers SET ip = ?, port = ?, sdk_password = ?, ssl = ?, enabled = ? WHERE id = ?",
+                    (ip, port, sdk_password, ssl_val, enabled_val, existing["id"])
+                )
+            else:
+                conn.execute(
+                    "UPDATE servers SET ip = ?, port = ?, ssl = ?, enabled = ? WHERE id = ?",
+                    (ip, port, ssl_val, enabled_val, existing["id"])
+                )
+            updated += 1
+        else:
+            conn.execute(
+                "INSERT INTO servers (name, ip, port, sdk_password, ssl, enabled) VALUES (?, ?, ?, ?, ?, ?)",
+                (name, ip, port, sdk_password, ssl_val, enabled_val)
+            )
+            added += 1
+
+    conn.commit()
+    conn.close()
+
+    if added or updated:
+        threading.Thread(target=collect).start()
+
+    return jsonify({"ok": 1, "added": added, "updated": updated, "errors": errors})
 
 
 @app.route("/api/ack/<int:server_id>", methods=["POST"])
@@ -3974,6 +4100,37 @@ cat > $INSTALL_DIR/templates/settings.html << 'SETTINGSEOF'
                 {% endif %}
             </div>
         </div>
+
+        {% if logged_in %}
+        <!-- Экспорт / импорт регистраторов -->
+        <div class="card mt-4">
+            <div class="card-header">
+                <i class="bi bi-arrow-down-up"></i> Экспорт / импорт регистраторов
+            </div>
+            <div class="card-body">
+                <p style="font-size:0.85rem; color:var(--muted);">
+                    Экспорт сохраняет названия, адреса и SDK-пароли всех серверов
+                    в один файл — для бэкапа или переноса на другую установку.
+                    <strong style="color:var(--yellow);">Файл содержит пароли в открытом виде</strong> —
+                    храните и передавайте его так же осторожно, как сами пароли.
+                </p>
+                <a href="/api/servers/export" class="btn btn-outline-primary btn-sm mb-3" download>
+                    <i class="bi bi-download"></i> Экспортировать в файл
+                </a>
+                <hr style="border-color: var(--border);">
+                <p style="font-size:0.85rem; color:var(--muted);" class="mb-2">
+                    Импорт добавляет серверы, которых ещё нет (по названию), и
+                    обновляет уже существующие. Пустой пароль в файле не затирает
+                    уже сохранённый.
+                </p>
+                <input type="file" class="form-control form-control-sm mb-2" id="importFile" accept=".json,application/json">
+                <button class="btn btn-outline-success btn-sm" onclick="importServers()">
+                    <i class="bi bi-upload"></i> Импортировать из файла
+                </button>
+                <div id="importResult" class="mt-2"></div>
+            </div>
+        </div>
+        {% endif %}
     </div>
 </div>
 
@@ -4186,6 +4343,39 @@ document.getElementById('editForm').addEventListener('submit', async function(e)
     if (r.ok) location.reload();
     else alert('Ошибка при сохранении');
 });
+
+async function importServers() {
+    var fileInput = document.getElementById('importFile');
+    var resultDiv = document.getElementById('importResult');
+    if (!fileInput.files.length) {
+        alert('Сначала выберите файл');
+        return;
+    }
+    var text = await fileInput.files[0].text();
+    var data;
+    try {
+        data = JSON.parse(text);
+    } catch (e) {
+        resultDiv.innerHTML = '<div class="alert alert-danger py-2 mb-0">Файл повреждён или это не JSON</div>';
+        return;
+    }
+    var r = await fetch('/api/servers/import', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(data)
+    });
+    var result = await r.json();
+    if (r.ok) {
+        var msg = 'Добавлено: ' + result.added + ', обновлено: ' + result.updated;
+        if (result.errors && result.errors.length) {
+            msg += '<br><span style="color:var(--yellow);">' + result.errors.map(escapeHtml).join('<br>') + '</span>';
+        }
+        resultDiv.innerHTML = '<div class="alert alert-success py-2 mb-0">' + msg + '</div>';
+        setTimeout(function() { location.reload(); }, 1800);
+    } else {
+        resultDiv.innerHTML = '<div class="alert alert-danger py-2 mb-0">' + escapeHtml(result.error || 'Ошибка импорта') + '</div>';
+    }
+}
 
 async function testConnection() {
     var data = Object.fromEntries(new FormData(document.getElementById('addForm')));
