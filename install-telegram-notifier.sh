@@ -1208,22 +1208,35 @@ esac
 # переживает переустановки бота отдельно от дашборда).
 echo ""
 echo "  • Определение установленной версии (коммит main на GitHub)..."
-LATEST_COMMIT=$(curl -fsSL --connect-timeout 10 --max-time 15 \
+# -w дописывает реальный HTTP-код в конец вывода — без этого сбой (сеть,
+# лимит запросов GitHub API — 60/час без токена на IP) выглядел ровно
+# одинаково что при 200, что при 403, что при полном отсутствии ответа.
+GITHUB_API_RAW=$(curl -sS --connect-timeout 10 --max-time 15 --retry 2 --retry-delay 3 \
     -H "Accept: application/vnd.github+json" \
-    "https://api.github.com/repos/scp-oss/TRASSIR-Monitor/commits/main" 2>/dev/null | \
-    "$VENV_PYTHON" -c "
+    -w '\nHTTPSTATUS:%{http_code}' \
+    "https://api.github.com/repos/scp-oss/TRASSIR-Monitor/commits/main" 2>/dev/null)
+GITHUB_HTTP_CODE=$(echo "$GITHUB_API_RAW" | tail -1 | sed 's/HTTPSTATUS://')
+GITHUB_BODY=$(echo "$GITHUB_API_RAW" | sed '$d')
+
+LATEST_COMMIT=""
+if [ "$GITHUB_HTTP_CODE" = "200" ]; then
+    LATEST_COMMIT=$(echo "$GITHUB_BODY" | "$VENV_PYTHON" -c "
 import json, sys
 try:
     print(json.load(sys.stdin)['sha'][:7])
 except Exception:
     pass
 " 2>/dev/null)
+fi
 
 if [ -n "$LATEST_COMMIT" ]; then
     echo "$LATEST_COMMIT" > "$INSTALL_DIR/data/.installed_commit_telegram"
     echo "    ✓ Версия зафиксирована: $LATEST_COMMIT"
 else
-    echo -e "    ${YELLOW}⚠ Не удалось обратиться к GitHub — версия будет показываться как '?'${NC}"
+    echo -e "    ${YELLOW}⚠ Не удалось определить версию через GitHub API (HTTP ${GITHUB_HTTP_CODE:-нет ответа}) — версия будет показываться как '?'${NC}"
+    if [ "$GITHUB_HTTP_CODE" = "403" ]; then
+        echo -e "    ${YELLOW}Похоже на лимит запросов к GitHub API (60/час без токена на один IP) — попробуйте обновить позже.${NC}"
+    fi
 fi
 
 # ============================================

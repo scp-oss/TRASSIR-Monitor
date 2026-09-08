@@ -1302,6 +1302,71 @@ install over a cosmetic feature).
   `[true]`, the third (no marker, not installed) shows plain `[false]`
   with nothing extra.
 
+## Version stamp still showed "?" after updating — made the failure diagnosable (2026-09-08)
+
+Immediate live follow-up to the commit-stamping feature above: the user
+updated and the commit still showed `?`. Two real possibilities, and no
+way from this session to tell which without server access: (1) the
+update simply hasn't actually been re-run yet against this exact commit
+(the stamping only exists from this point forward — anything installed
+by an older `install-*.sh` never wrote the marker file, and "update"
+has to mean specifically re-running the installer, not just refreshing
+the page), or (2) the install genuinely ran but the GitHub API call
+inside it failed — silently, because the original version only ever
+printed one generic warning line regardless of *why* it failed (DNS
+failure, timeout, HTTP error, GitHub API rate limit — all looked
+identical: empty `$LATEST_COMMIT`, same warning text). Given
+`z2r_autobench`'s own `CLAUDE.md` documents this exact class of problem
+for a *different* project ("z2r core install — GitHub is not reliable
+from every provider" — DNS spoofing, degraded `api.github.com`/
+`raw.githubusercontent.com` lasting hours on some hosting providers),
+this was worth taking seriously as a real possibility here too, not
+dismissed as unlikely.
+
+**Fixed the diagnosability half of this** (the only half fixable
+without seeing the actual server): all three installers' version-stamp
+step now captures curl's real `%{http_code}` via `-w` instead of
+throwing it away, and reports *which* failure occurred instead of one
+generic message:
+- HTTP `403` → explicitly flags "похоже на лимит запросов к GitHub API
+  (60/час без токена на IP)" — a very real risk specifically *because*
+  of how this engagement works: repeated install/reinstall testing
+  cycles against the same server IP, sometimes several per session,
+  each one now making its own `api.github.com` call, can plausibly
+  exhaust the unauthenticated 60-req/hour budget well before a human
+  would expect to hit any kind of "rate limit."
+- HTTP `000`/empty → explicitly flags that `api.github.com` gave no
+  response at all, distinct from (and not to be confused with)
+  `raw.githubusercontent.com` — the *different* GitHub service the same
+  install already just successfully used seconds earlier to fetch the
+  installer script itself. These are genuinely separate services that
+  can have independently different reachability from a given network —
+  one working is not evidence the other should too.
+- Added `--retry 2 --retry-delay 3` to the curl call itself for the
+  cheap, common case (a single transient blip resolves on retry without
+  needing a full second install run).
+
+**Deliberately not done in this pass**: a fallback mechanism that
+doesn't depend on `api.github.com` at all (e.g. `git ls-remote` against
+`github.com` directly, sidestepping the REST API and its rate limit
+entirely). Real option, but `git` is not currently in this project's
+required-package list (`install-trassir-monitor.sh`'s `apt-get install`
+set has no `git` — deliberately kept minimal), so adding it would be a
+new dependency introduced speculatively, before confirming this
+particular failure mode is actually what's happening on the real
+server. The honest next step is reading what the improved diagnostic
+message actually says on a real re-run, not guessing further — noted
+here so a future session doesn't reflexively skip straight to "add git
+ls-remote" without that read-the-log step actually happening first.
+
+Verified the new diagnostic logic directly against three real cases:
+a successful call to the real GitHub API (parses and stamps correctly,
+unchanged from before), an HTTP error response (correctly reports the
+real status code and, for 403 specifically, names the rate-limit
+hypothesis), and a totally unreachable host (correctly reports `000`/no
+response rather than misreporting it as a generic identical-looking
+failure).
+
 ## Publishing hygiene
 
 Public repo. Never commit real server hostnames/IPs, ISP/provider names,
