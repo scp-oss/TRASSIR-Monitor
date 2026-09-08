@@ -479,6 +479,7 @@ from flask_socketio import SocketIO
 from werkzeug.security import generate_password_hash, check_password_hash
 import requests
 import schedule
+import subprocess
 
 # ============================================
 # КОНФИГУРАЦИЯ ПРИЛОЖЕНИЯ
@@ -488,11 +489,61 @@ TEMPLATE_DIR = os.path.join(BASE_DIR, "templates")
 DB_PATH = os.path.join(BASE_DIR, "data", "trassir.db")
 LOG_DIR = os.path.join(BASE_DIR, "logs")
 SECRET_KEY_PATH = os.path.join(BASE_DIR, "data", "secret_key.txt")
+APP_VERSION = "v13.0"
 
 # ============================================
 # ИНИЦИАЛИЗАЦИЯ FLASK
 # ============================================
 app = Flask(__name__, template_folder=TEMPLATE_DIR)
+
+
+def _get_build_info():
+    """
+    Информация о версии для футера дашборда/настроек — тот же принцип,
+    что уже применён в launcher-trassir-monitor.sh: дата изменения
+    САМОГО ФАЙЛА app.py на диске (когда код в последний раз
+    сгенерировал установщик — меняется только при реальной установке
+    или обновлении) плюс короткий хеш git-коммита, если $BASE_DIR
+    неожиданно оказался настоящим git-чекаутом. В норме это никогда не
+    так — install-trassir-monitor.sh пишет app.py напрямую на диск через
+    heredoc, а не git clone (см. CLAUDE.md "Editing means editing the
+    heredoc directly") — поэтому честный "?" ожидаем почти всегда, а не
+    повод подделывать номер откуда-то ещё. Считается ОДИН раз при
+    старте процесса (модульная константа BUILD_INFO ниже), а не на
+    каждый запрос — ни то, ни другое не меняется, пока сам процесс жив.
+    """
+    try:
+        mtime = datetime.fromtimestamp(os.path.getmtime(__file__)).strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        mtime = "?"
+
+    commit = "?"
+    if os.path.isdir(os.path.join(BASE_DIR, ".git")):
+        try:
+            result = subprocess.run(
+                ["git", "-C", BASE_DIR, "rev-parse", "--short", "HEAD"],
+                capture_output=True, text=True, timeout=3
+            )
+            if result.returncode == 0:
+                commit = result.stdout.strip()
+        except Exception:
+            pass
+
+    return {"version": APP_VERSION, "mtime": mtime, "commit": commit}
+
+
+BUILD_INFO = _get_build_info()
+
+
+@app.context_processor
+def inject_build_info():
+    """
+    Делает build_info доступным во ВСЕХ шаблонах автоматически, без
+    ручной передачи в каждый render_template() по отдельности — иначе
+    добавление этой информации в base.html потребовало бы находить и
+    править каждый route, который вообще рендерит HTML.
+    """
+    return {"build_info": BUILD_INFO}
 
 
 def _load_or_create_secret_key():
@@ -2980,10 +3031,12 @@ cat > $INSTALL_DIR/templates/base.html << 'BASEEOF'
     <div class="container mt-4">
         {% block content %}{% endblock %}
     </div>
-    
+
+    {% block footer %}{% endblock %}
+
     <!-- Bootstrap JS (локальный) -->
     <script src="/static/bootstrap.bundle.min.js"></script>
-    
+
     <!-- Скрипты -->
     <script>
         // Экранирование пользовательских строк перед вставкой через innerHTML —
@@ -3567,6 +3620,12 @@ async function testConnection() {
     }
 }
 </script>
+{% endblock %}
+
+{% block footer %}
+<div class="text-center mt-4 mb-3" style="font-size:0.75rem; color:var(--muted);">
+    TRASSIR Monitor {{ build_info.version }} · обновлено: {{ build_info.mtime }}{% if build_info.commit != '?' %} · коммит: {{ build_info.commit }}{% endif %}
+</div>
 {% endblock %}
 DASHEOF
 echo "    ✓ dashboard.html создан ($(wc -c < $INSTALL_DIR/templates/dashboard.html) байт)"
@@ -4727,6 +4786,12 @@ async function testMail() {
 // Загружаем статус служб при открытии страницы
 loadServices();
 </script>
+{% endblock %}
+
+{% block footer %}
+<div class="text-center mt-4 mb-3" style="font-size:0.75rem; color:var(--muted);">
+    TRASSIR Monitor {{ build_info.version }} · обновлено: {{ build_info.mtime }}{% if build_info.commit != '?' %} · коммит: {{ build_info.commit }}{% endif %}
+</div>
 {% endblock %}
 SETTINGSEOF
 echo "    ✓ settings.html создан ($(wc -c < $INSTALL_DIR/templates/settings.html) байт)"

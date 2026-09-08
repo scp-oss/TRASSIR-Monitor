@@ -1167,6 +1167,52 @@ of this repo and confirmed the displayed hash matches `git rev-parse
 bare directory with no `.git` at all and confirmed it prints `?` rather
 than crashing or hanging on the `git` call.
 
+## Same version/commit footer added to the dashboard and settings pages (2026-09-08)
+
+Direct follow-up to the launcher's commit-hash header: user asked for
+the same thing on the web dashboard and `/settings` page. Same
+constraint applies as the launcher (see "Launcher shows the local git
+commit hash" above) — `$BASE_DIR` on a real server is never a git
+checkout, `install-trassir-monitor.sh` writes `app.py` straight to disk
+via heredoc — so this mirrors the exact same honest-`?`-when-no-`.git`
+design rather than inventing a different one for the web app.
+
+- `_get_build_info()` (new, in `app.py`) computes `{version, mtime,
+  commit}` once: `version` is the existing hardcoded `APP_VERSION =
+  "v13.0"` constant (pulled out of the various places that string was
+  scattered as a literal — this is the first shared reference, the
+  scattered literals elsewhere were left alone, not worth a bigger
+  refactor for this change); `mtime` is `app.py`'s own on-disk
+  modification time (same principle as the launcher's `_SELF_MTIME` —
+  changes only when the installer actually regenerates this file);
+  `commit` is `git -C "$BASE_DIR" rev-parse --short HEAD` **only** if
+  `$BASE_DIR/.git` exists, else `?` — same `_git_short_commit()` logic
+  as the launcher, just re-expressed in Python since this runs inside
+  the Flask process, not the installer's bash.
+- Computed **once** at import time into a module-level `BUILD_INFO`,
+  not per-request — neither the file's mtime nor whether `.git` exists
+  can change while the gunicorn worker process is alive, so recomputing
+  on every page load (a `subprocess.run` per request, worst case) would
+  be pure waste.
+- Exposed to templates via `@app.context_processor` instead of adding
+  `build_info=BUILD_INFO` to every individual `render_template()` call
+  — the alternative would mean finding and editing every route that
+  renders HTML just to thread one extra constant through, for something
+  that never varies by request.
+- **Scoped to exactly the two pages asked for**, not a global footer:
+  `base.html` gained an empty `{% block footer %}{% endblock %}` right
+  after the shared content container, and only `dashboard.html` and
+  `settings.html` override it with the actual footer markup —
+  `server.html` and `login.html` inherit the empty default and show
+  nothing. Verified directly with `test_client()`: fetched all four
+  pages, confirmed the footer text is present on `/` and `/settings`
+  and absent on `/server/<id>` and `/login`.
+- Verified both `commit` branches for real: a sandboxed app with no
+  `.git` under its `BASE_DIR` reports `commit: "?"`; a second run where
+  `BASE_DIR` was made into an actual tiny git repo (`git init` + one
+  commit) correctly reports that repo's real short hash, matching
+  `git rev-parse --short HEAD` run independently against the same path.
+
 ## Publishing hygiene
 
 Public repo. Never commit real server hostnames/IPs, ISP/provider names,
