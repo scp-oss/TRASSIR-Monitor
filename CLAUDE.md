@@ -1021,6 +1021,53 @@ loudly diagnosable instead of silently confusing, with an immediate
 manual escape hatch that doesn't require nuking every other alert on
 the server to use.
 
+## Follow-up: staggered multi-camera recovery (3 cameras down, 1 recovers, 2 stay down) (2026-09-08)
+
+Direct follow-up to the alert-recovery investigation above: user asked
+whether the fix covers a specific multi-camera scenario — two cameras
+go offline, a third goes offline afterward, then one of the first two
+recovers while the other two stay down. Simulated this exact staggered
+sequence (3 separate `collect()` polls, distinct camera names, no
+duplicates) against a real SQLite DB: **the straightforward case
+already works correctly** — after the recovering camera's next poll,
+exactly 2 alerts stay open (the two still-down cameras), the recovered
+one closes. So the core per-camera matching handles "some but not all
+recover" fine when it has real per-camera data to work with.
+
+**But looking for edge cases in this specific scenario surfaced one
+more real, previously-undiagnosable gap**: the "get list of channels
+failed this poll" case (`channels_info` is `{"ok": 0, ...}` — a
+transient `/objects/` HTTP error or timeout, not an exception, so it
+was never logged anywhere) falls through to
+`elif health["ch_o"] == health["ch_t"]:` — which can only close
+**every** open camera alert on a server at once, because health only
+reports an aggregate online/total count, never which specific camera is
+which. When recovery is *partial* (exactly this scenario — 1 of 3
+back, not all 3), that aggregate count can't equal the total, so the
+`elif` never fires either — and there was no `else`, so this case was
+completely silent: no alert closes that cycle, and nothing in the logs
+explained why. Proven with a synthetic test: fail `get_channels_info()`
+on the exact poll where partial recovery happens, confirm zero alerts
+close that cycle, then confirm they resume closing correctly the moment
+`get_channels_info()` succeeds again on the next poll — **this is a
+one-cycle delay under a transient API hiccup, not a permanent stuck
+state**, but it was a completely silent one, indistinguishable from a
+real bug from the log output alone.
+
+Added the missing `else` branch: logs
+`не удалось получить список каналов в этом опросе (<error>) — открытые
+алерты по камерам проверятся заново на следующем опросе` whenever a
+server has open camera alerts and this poll couldn't get per-camera
+detail to check them. This doesn't change behavior (still correctly
+does nothing rather than guessing which camera recovered — guessing
+wrong would be worse than a one-cycle delay) — it just makes what was
+previously invisible now show up in `logs/collect.log`, so if this
+symptom is reported again the very first thing to check is whether that
+line is present and, critically, whether it repeats on *every*
+subsequent poll (pointing at a persistent connectivity/API problem
+worth investigating separately) versus appearing once or twice before
+alerts start closing normally (the expected, harmless transient case).
+
 ## Publishing hygiene
 
 Public repo. Never commit real server hostnames/IPs, ISP/provider names,
