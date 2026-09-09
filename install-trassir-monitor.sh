@@ -403,6 +403,14 @@ pip install --index-url https://pypi.org/simple/ --timeout=600 requests -q 2>/de
     pip install --index-url https://pypi.org/simple/ --timeout=900 requests
 echo "      ✓ requests установлен"
 
+# Устанавливаем PySocks — без него requests не умеет схему socks5://
+# в параметре proxies (тихо падает с MissingSchema/ошибкой прокси).
+# Нужен для SOCKS5-варианта отправки в Telegram-боте (тот же venv).
+echo "    • Установка PySocks (поддержка SOCKS5 для requests)..."
+pip install --index-url https://pypi.org/simple/ --timeout=600 PySocks -q 2>/dev/null || \
+    pip install --index-url https://pypi.org/simple/ --timeout=900 PySocks
+echo "      ✓ PySocks установлен"
+
 # Устанавливаем schedule
 echo "    • Установка schedule..."
 pip install --index-url https://pypi.org/simple/ --timeout=600 schedule -q 2>/dev/null || \
@@ -2300,6 +2308,12 @@ def api_telegram_chats():
     return jsonify({"ok": 0}), 400
 
 
+def _mask_secret_url(url):
+    """Маскирует логин:пароль внутри URL (scheme://user:pass@host) перед показом в UI —
+    тот же приём, что и sed-маскировка в install-telegram-notifier.sh при вводе прокси."""
+    return re.sub(r'(://[^:@/\s]+:)([^@\s]+)(@)', r'\1***\3', url or "")
+
+
 @app.route("/api/telegram/settings", methods=["GET", "POST"])
 def api_telegram_settings():
     conn = get_db()
@@ -2318,13 +2332,29 @@ def api_telegram_settings():
                         result["token_configured"] = True
                         result["token_masked"] = token[:10] + "..." + token[-4:]
                     result["proxy_url"] = cfg["telegram"].get("proxy_url", "").strip()
-                    result["proxy_configured"] = bool(cfg["telegram"].get("proxy", "").strip())
+                    ini_proxy = cfg["telegram"].get("proxy", "").strip()
+                    result["proxy_configured"] = bool(ini_proxy)
+                    result["proxy_masked"] = _mask_secret_url(ini_proxy)
                     break
-        # Настройки из БД — только для авторизованных
+        # Настройки из БД — только для авторизованных. Способ отправки
+        # (proxy_url/api_base/api_key) можно менять здесь без переустановки
+        # бота — tg_bot.py перечитывает эти три ключа из той же БД на
+        # каждую отправку (см. get_db_transport_overrides() в tg_bot.py).
+        # proxy_url и api_key могут нести секрет (логин:пароль прокси,
+        # ключ доступа к relay) — как и token выше, наружу отдаём только
+        # факт настройки + маскированное значение, никогда сырое (форма
+        # в settings.html трактует пустое поле как "не менять", как и с
+        # паролем администратора/серверов).
         if session.get("logged_in"):
             try:
                 s = dict(conn.execute("SELECT key, value FROM telegram_settings").fetchall())
+                raw_proxy_url = s.pop("proxy_url", "")
+                raw_api_key = s.pop("api_key", "")
                 result.update(s)
+                result["proxy_url_configured"] = bool(raw_proxy_url)
+                result["proxy_url_masked"] = _mask_secret_url(raw_proxy_url)
+                result["api_key_configured"] = bool(raw_api_key)
+                result["api_key_masked"] = (raw_api_key[:4] + "..." + raw_api_key[-4:]) if len(raw_api_key) > 8 else ("***" if raw_api_key else "")
             except Exception:
                 pass
         conn.close()
@@ -2333,6 +2363,14 @@ def api_telegram_settings():
         conn.close()
         return jsonify({"ok": 0, "error": "Требуется авторизация"}), 403
     data = request.json or {}
+    proxy_url = str(data.get("proxy_url", "")).strip()
+    if proxy_url and not re.match(r'^(https?|socks5h?)://', proxy_url, re.IGNORECASE):
+        conn.close()
+        return jsonify({"ok": 0, "error": "Прокси должен начинаться с http://, https://, socks5:// или socks5h://"}), 400
+    api_base = str(data.get("api_base", "")).strip()
+    if api_base and not re.match(r'^https?://', api_base, re.IGNORECASE):
+        conn.close()
+        return jsonify({"ok": 0, "error": "Адрес своего API (workers/relay) должен начинаться с http:// или https://"}), 400
     for key, value in data.items():
         conn.execute("INSERT OR REPLACE INTO telegram_settings (key, value) VALUES (?, ?)", (key, str(value)))
     conn.commit()
@@ -4563,9 +4601,7 @@ function renderTelegram(chats, cfg) {
     } else {
         html += '<div class="alert alert-warning py-2 mb-3">⚠️ Токен не настроен</div>';
     }
-    if (cfg.proxy_url) {
-        html += '<div class="mb-2" style="color:var(--muted);font-size:0.85rem;">Прокси: ' + escapeHtml(cfg.proxy_url) + '</div>';
-    }
+    html += renderTgTransport(cfg);
     html += '<div class="mb-3"><strong>Получатели:</strong></div>';
     if (chats.length) {
         chats.forEach(function(c) {
@@ -4590,6 +4626,78 @@ function renderTelegram(chats, cfg) {
         '<button class="btn btn-outline-info btn-sm mt-2" onclick="testTelegram()"><i class="bi bi-send"></i> Тест</button>' +
         '<div id="tgTestResult" class="mt-2"></div>';
     document.getElementById('telegramBody').innerHTML = html;
+}
+
+function renderTgTransport(cfg) {
+    var proxyConfigured = !!(cfg.proxy_url_configured || cfg.proxy_configured);
+    var proxyMasked = cfg.proxy_url_masked || cfg.proxy_masked || '';
+    var apiBase = cfg.api_base || '';
+    var mode = apiBase ? 'relay' : (proxyConfigured ? 'proxy' : 'direct');
+    var apiKeyHint = cfg.api_key_configured ? ('настроен: ' + escapeHtml(cfg.api_key_masked || '***')) : 'не настроен';
+    window.__tgProxyConfigured = proxyConfigured;
+
+    var html = '<div class="mb-3 p-2" style="background:var(--bg);border-radius:8px;">' +
+        '<div class="mb-2" style="font-size:0.9rem;"><strong>Способ отправки в Telegram:</strong></div>' +
+        '<div class="form-check">' +
+        '<input class="form-check-input" type="radio" name="tgMode" id="tgModeDirect" value="direct" onchange="tgModeChanged()" ' + (mode==='direct'?'checked':'') + '>' +
+        '<label class="form-check-label" for="tgModeDirect">Напрямую (без прокси) — api.telegram.org</label>' +
+        '</div>' +
+        '<div class="form-check">' +
+        '<input class="form-check-input" type="radio" name="tgMode" id="tgModeProxy" value="proxy" onchange="tgModeChanged()" ' + (mode==='proxy'?'checked':'') + '>' +
+        '<label class="form-check-label" for="tgModeProxy">Через прокси (HTTP или SOCKS5)</label>' +
+        '</div>' +
+        '<div id="tgProxyFields" class="ms-4 mt-1 mb-2" style="display:' + (mode==='proxy'?'block':'none') + ';">' +
+        '<input type="text" id="tgProxyUrl" class="form-control form-control-sm" placeholder="' + (proxyConfigured ? escapeHtml(proxyMasked) + ' (оставьте пустым чтобы не менять)' : 'socks5://host:port или http://login:pass@host:port') + '">' +
+        '<small style="color:var(--muted);">socks5:// требует пакет PySocks (устанавливается вместе с дашбордом)</small>' +
+        '</div>' +
+        '<div class="form-check">' +
+        '<input class="form-check-input" type="radio" name="tgMode" id="tgModeRelay" value="relay" onchange="tgModeChanged()" ' + (mode==='relay'?'checked':'') + '>' +
+        '<label class="form-check-label" for="tgModeRelay">Через свой relay/worker (обход блокировки без прокси)</label>' +
+        '</div>' +
+        '<div id="tgRelayFields" class="ms-4 mt-1 mb-2" style="display:' + (mode==='relay'?'block':'none') + ';">' +
+        '<input type="text" id="tgApiBase" class="form-control form-control-sm mb-1" placeholder="https://ваш-домен.example" value="' + escapeHtml(apiBase) + '">' +
+        '<input type="text" id="tgApiKey" class="form-control form-control-sm" placeholder="Ключ авторизации — ' + apiKeyHint + ', оставьте пустым чтобы не менять">' +
+        '<small style="color:var(--muted);">Запрос уйдёт на &lt;адрес&gt;/bot&lt;токен&gt;/sendMessage?auth=&lt;ключ&gt; — это ДОЛЖЕН быть ваш собственный, доверенный сервер/worker: токен бота уходит на него открытым текстом, как на настоящий api.telegram.org.</small>' +
+        '</div>' +
+        '<button type="button" class="btn btn-sm btn-outline-primary mt-1" onclick="saveTgTransport()"><i class="bi bi-check-lg"></i> Сохранить способ отправки</button>' +
+        '<div id="tgTransportResult" class="mt-2"></div>' +
+        '</div>';
+    return html;
+}
+
+function tgModeChanged() {
+    var mode = document.querySelector('input[name="tgMode"]:checked').value;
+    document.getElementById('tgProxyFields').style.display = (mode === 'proxy') ? 'block' : 'none';
+    document.getElementById('tgRelayFields').style.display = (mode === 'relay') ? 'block' : 'none';
+}
+
+async function saveTgTransport() {
+    var mode = document.querySelector('input[name="tgMode"]:checked').value;
+    var payload = {};
+    if (mode === 'direct') {
+        payload = {proxy_url: '', api_base: '', api_key: ''};
+    } else if (mode === 'proxy') {
+        var proxyUrl = document.getElementById('tgProxyUrl').value.trim();
+        if (!proxyUrl && !window.__tgProxyConfigured) { alert('Укажите адрес прокси (или переключитесь на "Напрямую")'); return; }
+        payload = {api_base: '', api_key: ''};
+        if (proxyUrl) { payload.proxy_url = proxyUrl; }
+    } else {
+        var apiBase = document.getElementById('tgApiBase').value.trim();
+        if (!apiBase) { alert('Укажите адрес своего relay/worker'); return; }
+        payload = {api_base: apiBase, proxy_url: ''};
+        var apiKey = document.getElementById('tgApiKey').value.trim();
+        if (apiKey) { payload.api_key = apiKey; }
+    }
+    var resultDiv = document.getElementById('tgTransportResult');
+    resultDiv.innerHTML = '<small style="color:var(--muted);">Сохранение...</small>';
+    var r = await fetch('/api/telegram/settings', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)});
+    var d = await r.json();
+    if (d.ok) {
+        resultDiv.innerHTML = '<small style="color:var(--green);">✅ Сохранено</small>';
+        loadTelegramSection();
+    } else {
+        resultDiv.innerHTML = '<small style="color:var(--red);">❌ ' + escapeHtml(d.error || 'Ошибка') + '</small>';
+    }
 }
 
 async function addTgChat() {

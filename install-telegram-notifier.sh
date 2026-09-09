@@ -436,29 +436,93 @@ CHECK_INTERVAL = 10  # заменяется sed при установке
 # РАБОТА С КОНФИГУРАЦИОННЫМ ФАЙЛОМ
 # ============================================
 
+def get_db_transport_overrides():
+    """
+    Читает переопределения способа отправки (proxy_url/api_base/api_key)
+    из таблицы telegram_settings — их можно менять в настройках дашборда
+    без переустановки бота и без перезапуска службы (читаются заново на
+    каждую отправку). Пустая строка/отсутствие строки = не переопределять,
+    оставить то что в config.ini (proxy) или пусто (api_base/api_key).
+    """
+    overrides = {}
+    try:
+        conn = sqlite3.connect(DB_PATH, timeout=5)
+        rows = conn.execute(
+            "SELECT key, value FROM telegram_settings WHERE key IN ('proxy_url','api_base','api_key')"
+        ).fetchall()
+        conn.close()
+        for k, v in rows:
+            if v:
+                overrides[k] = v
+    except Exception:
+        # БД может быть недоступна (первый запуск, миграция и т.п.) —
+        # тихо работаем с тем, что есть в config.ini.
+        pass
+    return overrides
+
+
 def get_config():
-    """Читает конфигурацию из config.ini."""
+    """Читает конфигурацию из config.ini + переопределения способа отправки из БД."""
     try:
         cfg = configparser.ConfigParser()
         cfg.read(CONFIG_FILE)
         if 'telegram' not in cfg:
             return None
-        return {
+        result = {
             'token': cfg['telegram'].get('token', ''),
             'proxy': cfg['telegram'].get('proxy', ''),
-            'monitor_url': cfg['telegram'].get('monitor_url', '')
+            'monitor_url': cfg['telegram'].get('monitor_url', ''),
+            'api_base': '',
+            'api_key': '',
         }
+        overrides = get_db_transport_overrides()
+        if overrides.get('proxy_url'):
+            result['proxy'] = overrides['proxy_url']
+        if overrides.get('api_base'):
+            result['api_base'] = overrides['api_base']
+        if overrides.get('api_key'):
+            result['api_key'] = overrides['api_key']
+        return result
     except Exception as e:
         print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] ERRO чтение конфигурации: {e}")
         return None
 
 
 def get_proxies():
-    """Формирует словарь прокси для requests."""
+    """
+    Формирует словарь прокси для requests. Поддерживает http(s):// и,
+    если в venv установлен PySocks, socks5://.../socks5h://... — requests
+    сам разбирает схему по URL, отдельный код для SOCKS5 не нужен.
+    """
     cfg = get_config()
     if not cfg or not cfg['proxy']:
         return {}
     return {'http': cfg['proxy'], 'https': cfg['proxy']}
+
+
+def _telegram_api_url(cfg, method):
+    """
+    Строит URL запроса к Telegram Bot API.
+
+    По умолчанию — обычный https://api.telegram.org/bot<token>/<method>.
+    Если в настройках указан свой api_base (собственный Cloudflare
+    Worker/relay, поднятый и доверенный ПОЛЬЗОВАТЕЛЕМ САМОСТОЯТЕЛЬНО —
+    ни один конкретный чужой домен здесь никогда не зашивается по
+    умолчанию, см. CLAUDE.md "Telegram: способы отправки"), запрос
+    уходит на <api_base>/bot<token>/<method>, и если задан api_key —
+    добавляется ?auth=<api_key> query-параметром (типовой способ,
+    которым такие relay проверяют доступ).
+    """
+    token = cfg['token']
+    api_base = (cfg.get('api_base') or '').strip().rstrip('/')
+    if not api_base:
+        return f"https://api.telegram.org/bot{token}/{method}"
+    url = f"{api_base}/bot{token}/{method}"
+    api_key = (cfg.get('api_key') or '').strip()
+    if api_key:
+        from urllib.parse import quote
+        url += f"?auth={quote(api_key, safe='')}"
+    return url
 
 
 # ============================================
@@ -479,7 +543,7 @@ def send_telegram_message(chat_id, text):
         return False
 
     try:
-        url = f"https://api.telegram.org/bot{cfg['token']}/sendMessage"
+        url = _telegram_api_url(cfg, "sendMessage")
         payload = {
             'chat_id': chat_id,
             'text': text,
