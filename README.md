@@ -56,14 +56,14 @@
 уведомлений, смены пароля, обновления и удаления:
 
 ```bash
-wget -O launcher-trassir-monitor.sh https://raw.githubusercontent.com/scp-oss/TRASSIR-Monitor/main/launcher-trassir-monitor.sh
+wget -O launcher-trassir-monitor.sh https://raw.githubusercontent.com/naumenis-code/TRASSIR-Monitor/main/launcher-trassir-monitor.sh
 sudo bash launcher-trassir-monitor.sh
 ```
 
 Или той же командой в одну строку:
 
 ```bash
-wget -O launcher-trassir-monitor.sh https://raw.githubusercontent.com/scp-oss/TRASSIR-Monitor/main/launcher-trassir-monitor.sh; sudo bash launcher-trassir-monitor.sh
+wget -O launcher-trassir-monitor.sh https://raw.githubusercontent.com/naumenis-code/TRASSIR-Monitor/main/launcher-trassir-monitor.sh; sudo bash launcher-trassir-monitor.sh
 ```
 
 > ⚠️ Всегда используйте `-O <имя>` при повторном скачивании. Без него, если
@@ -118,7 +118,7 @@ Email уведомления — не нужно возвращаться в м�
 ### 1. Основной монитор
 
 ```bash
-wget -O install-trassir-monitor.sh https://raw.githubusercontent.com/scp-oss/TRASSIR-Monitor/main/install-trassir-monitor.sh
+wget -O install-trassir-monitor.sh https://raw.githubusercontent.com/naumenis-code/TRASSIR-Monitor/main/install-trassir-monitor.sh
 bash install-trassir-monitor.sh
 ```
 
@@ -148,7 +148,7 @@ bash install-trassir-monitor.sh
 ### 2. Telegram-уведомления *(опционально)*
 
 ```bash
-wget -O install-telegram-notifier.sh https://raw.githubusercontent.com/scp-oss/TRASSIR-Monitor/main/install-telegram-notifier.sh
+wget -O install-telegram-notifier.sh https://raw.githubusercontent.com/naumenis-code/TRASSIR-Monitor/main/install-telegram-notifier.sh
 bash install-telegram-notifier.sh
 ```
 
@@ -162,7 +162,7 @@ bash install-telegram-notifier.sh
 ### 3. Email-уведомления *(опционально)* `v1.3`
 
 ```bash
-wget -O install-mail-notifier.sh https://raw.githubusercontent.com/scp-oss/TRASSIR-Monitor/main/install-mail-notifier.sh
+wget -O install-mail-notifier.sh https://raw.githubusercontent.com/naumenis-code/TRASSIR-Monitor/main/install-mail-notifier.sh
 bash install-mail-notifier.sh
 ```
 
@@ -277,7 +277,7 @@ sudo bash uninstall-mail-notifier.sh
 
 # Удалить весь дашборд (Telegram/Email снимаются вместе с ним — без
 # дашборда они всё равно не могут работать)
-wget -O uninstall-trassir-monitor.sh https://raw.githubusercontent.com/scp-oss/TRASSIR-Monitor/main/uninstall-trassir-monitor.sh
+wget -O uninstall-trassir-monitor.sh https://raw.githubusercontent.com/naumenis-code/TRASSIR-Monitor/main/uninstall-trassir-monitor.sh
 sudo bash uninstall-trassir-monitor.sh
 
 # То же самое, если дашборд уже установлен — короткая команда без wget
@@ -456,6 +456,6 @@ SOCKS5 требует пакет `PySocks` — ставится автомати
 <div align="center">
 
 **Сделано для администраторов систем видеонаблюдения TRASSIR**  
-Вопросы и предложения — через [Issues](https://github.com/scp-oss/TRASSIR-Monitor/issues)
+Вопросы и предложения — через [Issues](https://github.com/naumenis-code/TRASSIR-Monitor/issues)
 
 </div>

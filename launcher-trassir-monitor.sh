@@ -25,7 +25,7 @@ NC='\033[0m'
 
 INSTALL_DIR="/opt/trassir-monitor"
 SELF_INSTALL_PATH="/usr/local/bin/trassir-monitor"
-REPO_RAW_BASE="https://raw.githubusercontent.com/scp-oss/TRASSIR-Monitor/main"
+REPO_RAW_BASE="https://raw.githubusercontent.com/naumenis-code/TRASSIR-Monitor/main"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
 

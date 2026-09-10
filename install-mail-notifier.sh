@@ -1443,7 +1443,7 @@ echo "  • Определение установленной версии (ко
 GITHUB_API_RAW=$(curl -sS --connect-timeout 10 --max-time 15 --retry 2 --retry-delay 3 \
     -H "Accept: application/vnd.github+json" \
     -w '\nHTTPSTATUS:%{http_code}' \
-    "https://api.github.com/repos/scp-oss/TRASSIR-Monitor/commits/main" 2>/dev/null)
+    "https://api.github.com/repos/naumenis-code/TRASSIR-Monitor/commits/main" 2>/dev/null)
 GITHUB_HTTP_CODE=$(echo "$GITHUB_API_RAW" | tail -1 | sed 's/HTTPSTATUS://')
 GITHUB_BODY=$(echo "$GITHUB_API_RAW" | sed '$d')
 
