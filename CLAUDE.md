@@ -1021,6 +1021,89 @@ loudly diagnosable instead of silently confusing, with an immediate
 manual escape hatch that doesn't require nuking every other alert on
 the server to use.
 
+## Camera alerts now matched by GUID, not name — closes the "renamed/deleted channel" ambiguity for new alerts (2026-09-15)
+
+Live report: alert count didn't match reality — 3 open "Камера офлайн"
+alerts while only 2 cameras were actually down, after a camera that
+"flapped" (dropped and recovered very quickly) supposedly left one
+alert stuck. The section above (2026-09-08) had already concluded the
+renamed/deleted-channel case was "fundamentally ambiguous" and couldn't
+be auto-closed safely — that conclusion was correct **given only a
+name to go on**, but it turns out a better identifier was available the
+whole time and simply wasn't being used.
+
+`TrassirClient.get_channels_info()` already fetches each channel's
+`guid` from `/objects/` (needed to then query `/objects/{guid}` for its
+own state) — it just threw the GUID away afterward and returned only a
+name-keyed `{name: bool}` dict. GUID is TRASSIR's own stable identifier
+for a channel object; unlike the name, it does not change if the
+channel is renamed, and two channels can never share one. That makes it
+the exact fix for the ambiguity the previous entry described as
+unresolvable: reconnect/rename during a fast flap can change a
+channel's *name* but not its *GUID*.
+
+**Change**: `get_channels_info()` now also returns
+`channels_by_guid: {guid: {"name": ..., "online": bool}}` (the existing
+name-keyed `channels` dict is untouched, still built the same way with
+the same conservative AND-merge for genuine name collisions — kept for
+the legacy path below). `alerts` gained a `channel_guid` column
+(migrated the same `PRAGMA table_info` way as `resolved_at`). Camera
+alerts are now created and closed primarily by GUID:
+- **Creation**: iterates `channels_by_guid` for offline channels,
+  storing the GUID on the new alert row; the "already open?" dedup
+  check is now `WHERE channel_guid = ?`, not `WHERE msg = ?` — this
+  also fixes a related latent bug the old text-match dedup had: two
+  *different* channels that happen to share a name would have produced
+  identical `msg` text, so the second one's alert would have silently
+  been treated as "already exists" and never created at all, hiding a
+  real second outage. Verified with a synthetic test: two channels
+  both named "Dup-Cam" (different GUIDs), both offline → two
+  independent alert rows, not one.
+- **Closing**: for an alert with a `channel_guid`, looks it up directly
+  in `channels_by_guid` — online → close (regardless of whether the
+  name changed since the alert was created; a `rename_note` in the log
+  line surfaces the rename for visibility, e.g. "камера восстановлена:
+  Cam-A (сейчас называется «Cam-A-new»)"); GUID genuinely absent from
+  the current list (channel actually deleted, not just renamed) → same
+  conservative "don't guess, log and leave open for manual reset" as
+  before.
+- **Legacy alerts** (already open at upgrade time, `channel_guid IS
+  NULL`) fall back to the exact old by-name matching — nothing about
+  the 2026-09-08 behavior changes for alerts that already existed
+  before this shipped; they age out normally as they close or get
+  manually dismissed, and every alert created from this point on
+  carries a GUID.
+- A channel with no GUID at all (defensive case — `get_channels_info()`
+  has always done `ch.get("guid", "")` rather than assuming it's
+  present) still gets tracked via the old name-based path rather than
+  silently dropped from alerting; verified with a synthetic
+  guid-less-channel test alongside the GUID-tracked ones in the same
+  poll.
+
+Verified end-to-end via simulated multi-cycle `collect()` runs against
+a real temp SQLite DB (extracted `app.py`, `TrassirClient` replaced
+with a scripted fake returning different `/health` + `/objects/`
+responses per cycle — same method as every other `collect()` bug in
+this file): (1) a channel offline under GUID `g1`/name "Cam-A" that
+reconnects under the SAME guid but a NEW name "Cam-A-new" now closes
+correctly on the very next poll (the exact bug reproduced and fixed —
+this would have stayed stuck forever under the pre-fix by-name logic);
+(2) two same-named channels with different GUIDs get independent
+alerts and close independently — one recovering does not affect the
+other, which is the direct fix for "N alerts open, fewer cameras
+actually down" when duplicate names are involved; (3) a genuinely
+still-down legacy (no-guid) alert stays open, unaffected.
+
+**Not changed / left as-is on purpose**: the `elif health["ch_o"] ==
+health["ch_t"]:` "close everything" shortcut and the "`channels_info`
+fetch failed this poll" branch below it — both already reasoned about
+in the 2026-09-08 entries above, neither touched by this fix. Also not
+touched: the UI. Alerts already show their creation timestamp
+(`alert.ts`) and a per-alert "Сбросить" dismiss button — sufficient to
+notice and manually clear the now-rare genuinely-unresolvable case
+(real channel deletion) without adding a new "unverifiable" badge; not
+worth the extra surface for a case this fix already makes much rarer.
+
 ## Follow-up: staggered multi-camera recovery (3 cameras down, 1 recovers, 2 stay down) (2026-09-08)
 
 Direct follow-up to the alert-recovery investigation above: user asked

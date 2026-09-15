@@ -782,6 +782,25 @@ def init_db():
     if "resolved_at" not in existing_cols:
         cursor.execute("ALTER TABLE alerts ADD COLUMN resolved_at DATETIME")
 
+    # Миграция: колонка channel_guid — для алертов "Камера офлайн: X"
+    # хранит GUID канала из TRASSIR (/objects/), а не только его ИМЯ,
+    # которое уже лежит в msg. Раньше автозакрытие алерта при
+    # восстановлении камеры сопоставляло исключительно по имени —
+    # если TRASSIR во время реконнекта показывал канал под слегка иным
+    # именем, либо канал был удалён и создан заново под тем же именем
+    # (новый GUID), либо два канала изначально называются одинаково,
+    # сопоставление по имени могло никогда не совпасть — алерт "висел"
+    # открытым навсегда, даже когда камера объективно уже в сети (и
+    # общий счётчик health.channels_online/total это подтверждал).
+    # GUID — устойчивый идентификатор объекта в TRASSIR, не зависящий от
+    # имени, поэтому сопоставление по нему не ловит эту путаницу в
+    # принципе. Для алертов, созданных ДО этой миграции, колонка будет
+    # NULL — collect() для них по-прежнему использует старое
+    # сопоставление по имени (см. её же комментарий ниже), никакой
+    # алерт не "потеряется" при обновлении.
+    if "channel_guid" not in existing_cols:
+        cursor.execute("ALTER TABLE alerts ADD COLUMN channel_guid TEXT")
+
     # ============================================
     # Таблица settings — настройки системы
     # ============================================
@@ -1051,7 +1070,16 @@ class TrassirClient:
             # через AND — "онлайн" только если ВСЕ одноимённые каналы
             # онлайн — так алерт никогда не закроется по ошибке, только,
             # в худшем случае, откроется чуть дольше, чем нужно.
+            # channels_by_guid — {guid: {"name": ..., "online": bool}} —
+            # GUID устойчив к переименованию/пересозданию канала под тем
+            # же именем и не может коллизировать (в отличие от имени),
+            # поэтому collect() сопоставляет алерты по нему, когда он
+            # есть (см. миграцию alerts.channel_guid выше по файлу).
+            # channels_status ({имя: bool}, со схлопыванием одноимённых
+            # каналов через AND) остаётся как есть — нужен для алертов,
+            # созданных ДО этой миграции, у которых guid ещё не записан.
             channels_status = {}
+            channels_by_guid = {}
             duplicate_names_warned = set()
             for i, ch in enumerate(channels_list):
                 try:
@@ -1082,11 +1110,14 @@ class TrassirClient:
                 else:
                     channels_status[name] = is_online
 
+                if ch["guid"]:
+                    channels_by_guid[ch["guid"]] = {"name": name, "online": is_online}
+
                 # Выводим прогресс для большого количества каналов
                 if (i + 1) % 10 == 0:
                     print(f"  Проверено {i + 1}/{len(channels_list)} каналов...")
 
-            return {"ok": 1, "channels": channels_status}
+            return {"ok": 1, "channels": channels_status, "channels_by_guid": channels_by_guid}
         
         except Exception as e:
             return {"ok": 0, "error": str(e)}
@@ -1230,48 +1261,85 @@ def collect():
 
                 # channels_info уже получен параллельно в _fetch_server_data()
                 # (см. начало collect()) — здесь только раскладываем его на
-                # offline_names, сетевой запрос сюда не переносим.
-                offline_names = []
+                # offline_channels, сетевой запрос сюда не переносим.
+                # Список пар (guid, имя) — GUID нужен, чтобы новый алерт
+                # сразу создавался с устойчивым идентификатором канала
+                # (см. следующий блок и миграцию alerts.channel_guid выше
+                # по файлу), а не только с именем.
+                offline_channels = []
                 if channels_info and channels_info.get("ok"):
+                    channels_by_guid_pre = channels_info.get("channels_by_guid", {})
+                    for guid, info in channels_by_guid_pre.items():
+                        if not info["online"]:
+                            offline_channels.append((guid, info["name"]))
+                    # Запасной путь для канала без GUID (get_channels_info()
+                    # и раньше защищался .get("guid", "") на случай пустого
+                    # значения от TRASSIR — не должно происходить в норме,
+                    # но раз защита уже была заложена, не теряем такой канал
+                    # молча: не в channels_by_guid, потому что она построена
+                    # только из каналов с непустым guid, поэтому имя канала
+                    # без него встретится в channels_status (channels), но
+                    # не будет ни у одной записи в channels_by_guid_pre.
+                    names_with_guid = {info["name"] for info in channels_by_guid_pre.values()}
                     for ch_name, is_online in channels_info["channels"].items():
-                        if not is_online:
-                            offline_names.append(ch_name)
-                    print(f"  {server_name}: офлайн каналов: {len(offline_names)}")
+                        if not is_online and ch_name not in names_with_guid:
+                            offline_channels.append((None, ch_name))
+                    print(f"  {server_name}: офлайн каналов: {len(offline_channels)}")
 
                 # ============================================
                 # ВОССТАНОВЛЕНИЕ — ЗАКРЫВАЕМ АЛЕРТЫ ПО КАМЕРАМ
                 # ============================================
                 if channels_info and channels_info.get("ok"):
                     all_channels = channels_info["channels"]
+                    channels_by_guid = channels_info.get("channels_by_guid", {})
                     active_cam_alerts = conn.execute(
-                        "SELECT id, msg FROM alerts WHERE server_id = ? AND msg LIKE 'Камера офлайн:%' AND ack = 0",
+                        "SELECT id, msg, channel_guid FROM alerts WHERE server_id = ? AND msg LIKE 'Камера офлайн:%' AND ack = 0",
                         (server_id,)
                     ).fetchall()
                     for alert in active_cam_alerts:
                         # Извлекаем имя камеры из сообщения "Камера офлайн: CamName"
+                        # (используется как запасной вариант и для текста лога)
                         cam_name = alert["msg"].replace("Камера офлайн: ", "").strip()
-                        # Сопоставление идёт по ИМЕНИ канала (в alerts.msg не
-                        # хранится guid) — если канал переименован/удалён в
-                        # TRASSIR, автоматика не может отличить "уже
-                        # восстановился" от "больше не существует под этим
-                        # именем" и намеренно НЕ закрывает алерт сама (тихое
-                        # автозакрытие в этом случае рискованнее, чем алерт,
-                        # который придётся закрыть вручную через "Сбросить" —
-                        # см. новую кнопку у каждого алерта в server.html).
-                        # Печатаем явно, чтобы при живой жалобе "камера
-                        # восстановилась, а алерт висит" сразу было видно,
-                        # какая именно из двух причин это в конкретном случае.
-                        if cam_name not in all_channels:
-                            print(f"  ⚠ {server_name}: алерт «Камера офлайн: {cam_name}» не закрыт — "
-                                  f"канала с таким именем сейчас нет в списке TRASSIR "
-                                  f"(переименован или удалён?), сбросить вручную кнопкой у алерта")
-                        elif all_channels.get(cam_name, False):
-                            conn.execute(
-                                "UPDATE alerts SET ack = 1, resolved_at = datetime('now', '+3 hours') WHERE id = ?",
-                                (alert["id"],)
-                            )
-                            conn.commit()
-                            print(f"  ✅ {server_name}: камера восстановлена: {cam_name}")
+                        guid = alert["channel_guid"]
+                        if guid:
+                            # Устойчивое сопоставление по GUID канала — не
+                            # зависит от того, как канал сейчас называется
+                            # в TRASSIR (переименование/пересоздание под тем
+                            # же именем/дубликат имени раньше могли навсегда
+                            # "подвесить" алерт, потому что сопоставление
+                            # шло только по имени — см. комментарий у
+                            # миграции channel_guid выше по файлу).
+                            info = channels_by_guid.get(guid)
+                            if info is None:
+                                print(f"  ⚠ {server_name}: алерт «Камера офлайн: {cam_name}» не закрыт — "
+                                      f"канал с этим GUID больше не существует в TRASSIR "
+                                      f"(удалён?), сбросить вручную кнопкой у алерта")
+                            elif info["online"]:
+                                conn.execute(
+                                    "UPDATE alerts SET ack = 1, resolved_at = datetime('now', '+3 hours') WHERE id = ?",
+                                    (alert["id"],)
+                                )
+                                conn.commit()
+                                new_name = info["name"]
+                                rename_note = f" (сейчас называется «{new_name}»)" if new_name != cam_name else ""
+                                print(f"  ✅ {server_name}: камера восстановлена: {cam_name}{rename_note}")
+                        else:
+                            # Алерт создан ДО миграции channel_guid — guid
+                            # неизвестен, сопоставляем по имени как раньше
+                            # (тот же риск "переименовали/удалили" — просто
+                            # закрывать нельзя, см. комментарий выше в этой
+                            # же функции до правки).
+                            if cam_name not in all_channels:
+                                print(f"  ⚠ {server_name}: алерт «Камера офлайн: {cam_name}» не закрыт — "
+                                      f"канала с таким именем сейчас нет в списке TRASSIR "
+                                      f"(переименован или удалён?), сбросить вручную кнопкой у алерта")
+                            elif all_channels.get(cam_name, False):
+                                conn.execute(
+                                    "UPDATE alerts SET ack = 1, resolved_at = datetime('now', '+3 hours') WHERE id = ?",
+                                    (alert["id"],)
+                                )
+                                conn.commit()
+                                print(f"  ✅ {server_name}: камера восстановлена: {cam_name}")
                 elif health["ch_o"] == health["ch_t"]:
                     # Все камеры онлайн по health — закрываем все камерные алерты
                     conn.execute("""
@@ -1297,18 +1365,33 @@ def collect():
                           f"открытые алерты по камерам проверятся заново на следующем опросе")
 
                 # ============================================
-                # ГЕНЕРАЦИЯ АЛЕРТОВ ПО КАМЕРАМ — ОДИН НА КАМЕРУ
+                # ГЕНЕРАЦИЯ АЛЕРТОВ ПО КАМЕРАМ — ОДИН НА КАНАЛ (по GUID)
                 # ============================================
-                for cam_name in offline_names:
+                # Проверка "уже есть открытый алерт" идёт по GUID, а не по
+                # тексту сообщения — иначе два РАЗНЫХ канала с одинаковым
+                # именем (ничем не запрещено на уровне TRASSIR SDK) дали бы
+                # одинаковый message, и второй молча посчитался бы
+                # "уже существует", хотя это независимая камера со своим
+                # собственным статусом.
+                for guid, cam_name in offline_channels:
                     message = f"Камера офлайн: {cam_name}"
-                    existing = conn.execute(
-                        "SELECT id FROM alerts WHERE server_id = ? AND msg = ? AND ack = 0",
-                        (server_id, message)
-                    ).fetchone()
+                    if guid:
+                        existing = conn.execute(
+                            "SELECT id FROM alerts WHERE server_id = ? AND channel_guid = ? AND ack = 0",
+                            (server_id, guid)
+                        ).fetchone()
+                    else:
+                        # Без GUID (см. запасной путь выше) "channel_guid = NULL"
+                        # в SQL никогда не совпадёт ни с одной строкой — дедуп
+                        # для этого случая по-прежнему по тексту сообщения.
+                        existing = conn.execute(
+                            "SELECT id FROM alerts WHERE server_id = ? AND msg = ? AND ack = 0",
+                            (server_id, message)
+                        ).fetchone()
                     if not existing:
                         conn.execute(
-                            "INSERT INTO alerts (server_id, ts, level, msg) VALUES (?, datetime('now', '+3 hours'), 'warning', ?)",
-                            (server_id, message)
+                            "INSERT INTO alerts (server_id, ts, level, msg, channel_guid) VALUES (?, datetime('now', '+3 hours'), 'warning', ?, ?)",
+                            (server_id, message, guid)
                         )
                         print(f"  ⚠ {server_name}: новый алерт — {message}")
                 conn.commit()
