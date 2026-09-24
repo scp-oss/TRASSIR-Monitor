@@ -1574,6 +1574,84 @@ compare), and the two differ — silent otherwise, so an up-to-date
 module or one with no available comparison shows exactly what it did
 before this change.
 
+## Found a real latent bug in `_read_installed_commit`/`_read_commit_error` while adding the "Update all" summary hint (2026-09-24)
+
+Direct follow-up: asked to (1) make the header's `коммит: ?` actually
+useful (it always shows `?` for anyone using `wget`, i.e. the README's
+own recommended install method — this project is never distributed via
+`git clone`, so `_LOCAL_COMMIT` was permanently dead for essentially
+every real user) and (2) add a compact `[old] → [new]` hint next to
+"Update all" instead of making someone compare the per-module green
+notes by eye.
+
+(1) was simple: new `_header_commit_text()` falls back to showing
+`_LATEST_MAIN_COMMIT` (the same value the green per-module hint already
+fetches) labeled honestly as "актуальный коммит main" — a real answer
+instead of a `?` nobody could ever act on — while still showing the
+true `_LOCAL_COMMIT` for the rare case of an actual git checkout.
+Deliberately did NOT reuse the "коммит" label for this fallback value —
+it answers a different question (what's newest on GitHub right now,
+not what this exact file is running) and conflating the two would
+recreate the exact confusion this whole multi-message thread was about.
+
+(2) surfaced something worse than a missing feature: building
+`_update_all_hint()`, which calls `_read_installed_commit dashboard`
+directly (a literal string, not a variable), it always returned `?`
+even with a real commit file on disk — while the exact same function,
+called from `_module_line()` as `_read_installed_commit "$module"`,
+had been returning the correct hash all along (confirmed live by the
+user's own pasted menu output a few messages back). Same function, two
+different behaviors depending on the caller — a real bug, not a typo
+in the new code.
+
+**Root cause, confirmed with a minimal reproduction
+(`local x="hello" y="${x}_world"` → `y` comes out empty, on bash
+5.2.21):** a single `local` statement evaluates *all* of its
+right-hand sides before any of the new local bindings take effect —
+`local module="$1" path="...$module"` expands `$module` in the second
+assignment using whatever `module` meant *before* this statement ran,
+not the `$1` just bound moments earlier in the same statement. Both
+`_read_installed_commit()` and `_read_commit_error()` had exactly this
+shape since the commit-stamping feature was first added — and it
+"worked" only by pure accident: bash's `local` is dynamically scoped,
+so when `_module_line()` (which already has its own correctly-bound
+`local module="$4"`) calls either function, the callee's broken
+`$module` expansion happens to resolve to the *caller's* still-in-scope
+`module` variable — which happens to already hold the exact same
+value. Call it any other way — a literal string, from a caller with no
+same-named variable, or even from `_module_line()` after a future
+refactor renames its own local — and the accidental coupling breaks,
+silently returning `?` regardless of what's actually on disk. This is
+the kind of bug that survives code review and manual testing
+indefinitely because the one code path anyone actually exercises
+happens to be the one where the accident holds.
+
+Fixed by splitting both functions' `local` statements into two
+separate statements each (`local module="$1"` then
+`local path="..."` on the next line) — the standard-safe idiom,
+already used correctly elsewhere in this same file
+(`_module_line`/`_get_script`/`_run_installer`'s multi-var `local`
+lines never have one variable's value depend on another set in the
+same statement, which is why grepping for `local .*=.* .*=` and
+manually checking each hit was enough to confirm these were the only
+two affected). Verified by extracting the real functions straight out
+of the shipped file (not hand-retyped copies — the whole point was
+that a hand-copied test could just as easily "accidentally" work the
+same wrong way) into an isolated script and running the actual
+`show_menu()` sequence: the header, both per-module green hints, and
+the new `Update all  [73fe171] → [c70ced8]` line all showed correct,
+real values.
+
+**Worth remembering**: this bug was invisible through every previous
+round of testing in this file's history (`_module_line()`'s own manual
+verification, the multiple `test_client()`/simulation checks for the
+diagnostics work) precisely because every test happened to call
+through `_module_line()`. A function that's "verified working" only
+ever exercised via one caller isn't verified against what it does when
+called differently — worth testing a shared helper directly, standalone,
+not only through its one existing call site, especially one built on a
+`local module=X path=...$module` shape.
+
 ## Telegram: способы отправки (прямо / прокси-SOCKS5 / свой relay) — и почему в коде нет вшитого чужого домена
 
 Запрос: добавить в Telegram-бот несколько способов отправки — напрямую,

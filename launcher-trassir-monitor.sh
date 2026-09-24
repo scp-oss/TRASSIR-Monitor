@@ -66,7 +66,21 @@ _bool() { if "$1" >/dev/null 2>&1; then echo "true"; else echo "false"; fi; }
 # нигде не сохранялась вообще, теперь install-*.sh пишет её в конце
 # каждого успешного прогона.
 _read_installed_commit() {
-    local module="$1" path="$INSTALL_DIR/data/.installed_commit_$module"
+    # ВАЖНО: module и path — ДВА отдельных local, не один через пробел.
+    # "local module=\"\$1\" path=\"...\$module\"" в одну команду выглядит
+    # невинно, но в bash все правые части одного local-выражения
+    # разворачиваются ДО того, как новые локальные переменные реально
+    # появляются — path видел бы СТАРОЕ (обычно пустое) значение
+    # module, а не только что присвоенное "$1". Живой баг: это молча
+    # "работало" только там, где вызывающая функция (_module_line) уже
+    # сама имела свою локальную module с тем же именем и тем же
+    # значением по чистой случайности — а из _update_all_hint (вызов
+    # напрямую с литералом "dashboard"/"mail"/"telegram", без такой
+    # переменной у вызывающего) всегда тихо возвращало "?" независимо
+    # от того, что реально на диске. Разделено на два local — тот же
+    # фикс применён к _read_commit_error ниже по той же причине.
+    local module="$1"
+    local path="$INSTALL_DIR/data/.installed_commit_$module"
     if [ -f "$path" ]; then
         cat "$path" 2>/dev/null || echo "?"
     else
@@ -84,7 +98,8 @@ _read_installed_commit() {
 # УСПЕШНОЙ фиксации коммита, так что старая причина не может пережить
 # и запутать после реального исправления.
 _read_commit_error() {
-    local module="$1" path="$INSTALL_DIR/data/.installed_commit_${module}.error"
+    local module="$1"
+    local path="$INSTALL_DIR/data/.installed_commit_${module}.error"
     [ -f "$path" ] && cat "$path" 2>/dev/null
 }
 
@@ -463,9 +478,63 @@ _module_line() {
     fi
 }
 
+
+# Строка заголовка меню. "коммит: ?" здесь раньше означал ТОЛЬКО "этот
+# файл лаунчера не в git-чекауте" (_LOCAL_COMMIT) — а поскольку README
+# рекомендует именно wget, а не git clone, этот "?" был гарантирован
+# практически у ЛЮБОГО реального пользователя, всегда, независимо ни от
+# чего — бесполезное поле, не баг, но и не информация. Раз дашборд/
+# mail/telegram/сам лаунчер — всё один репозиторий на одном коммите
+# main, при отсутствии настоящего git-чекаута (частый случай) вместо
+# бессмысленного "?" показываем то же самое, что уже посчитано для
+# зелёной подсказки у модулей — актуальный коммит main на GitHub
+# (_LATEST_MAIN_COMMIT), с ЧЕСТНОЙ подписью "актуальный коммит main",
+# а не "коммит" — это не то же самое, что "какой коммит выполняется
+# прямо сейчас", и подменять одно другим без явной оговорки означало бы
+# наступить на те же грабли путаницы, из-за которых вообще была вся
+# эта переписка про "коммит: ?".
+_header_commit_text() {
+    if [ "$_LOCAL_COMMIT" != "?" ]; then
+        echo "коммит: ${_LOCAL_COMMIT}"
+    elif [ -n "$_LATEST_MAIN_COMMIT" ]; then
+        echo "актуальный коммит main: ${_LATEST_MAIN_COMMIT}"
+    else
+        echo "коммит: ?"
+    fi
+}
+
+# Короткая сводка рядом с "Update all" — если хоть один установленный
+# модуль отстаёт от _LATEST_MAIN_COMMIT, показываем "[старый] → [новый]"
+# одной строкой вместо необходимости сопоставлять зелёные подсказки у
+# каждого модуля по отдельности. Берём ПЕРВЫЙ найденный отстающий
+# коммит (Dashboard → Mail → Telegram) как представителя — этого
+# достаточно для типичного случая (модули обновляются вместе и обычно
+# на одном коммите), а не точная сводка по каждому индивидуально: та
+# уже и так есть у каждой строки модуля выше.
+_update_all_hint() {
+    [ -z "$_LATEST_MAIN_COMMIT" ] && return
+    local commit=""
+    if dashboard_installed >/dev/null 2>&1; then
+        commit="$(_read_installed_commit dashboard)"
+        [ "$commit" = "?" ] && commit=""
+        [ "$commit" = "$_LATEST_MAIN_COMMIT" ] && commit=""
+    fi
+    if [ -z "$commit" ] && email_installed >/dev/null 2>&1; then
+        commit="$(_read_installed_commit mail)"
+        [ "$commit" = "?" ] && commit=""
+        [ "$commit" = "$_LATEST_MAIN_COMMIT" ] && commit=""
+    fi
+    if [ -z "$commit" ] && telegram_installed >/dev/null 2>&1; then
+        commit="$(_read_installed_commit telegram)"
+        [ "$commit" = "?" ] && commit=""
+        [ "$commit" = "$_LATEST_MAIN_COMMIT" ] && commit=""
+    fi
+    [ -n "$commit" ] && echo -e "  ${GREEN}[${commit}] → [${_LATEST_MAIN_COMMIT}]${NC}"
+}
+
 show_menu() {
     clear
-    echo -e "${GREEN}${BOLD}TRASSIR-Monitor v13.0${NC} ${CYAN}(файл от: ${_SELF_MTIME}, коммит: ${_LOCAL_COMMIT})${NC}"
+    echo -e "${GREEN}${BOLD}TRASSIR-Monitor v13.0${NC} ${CYAN}(файл от: ${_SELF_MTIME}, $(_header_commit_text))${NC}"
     echo ""
     _module_line "1." dashboard_installed "Install Dashboard" "dashboard"
     _module_line "2." email_installed "Install Email notification" "mail"
@@ -473,7 +542,7 @@ show_menu() {
     echo ""
     echo "4.  Change admin passwd"
     echo ""
-    echo "5.  Update all"
+    echo -e "5.  Update all$(_update_all_hint)"
     echo "6.  Uninstall"
     echo ""
     echo "0.  Exit"
