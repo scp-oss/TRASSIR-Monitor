@@ -25,7 +25,7 @@ NC='\033[0m'
 
 INSTALL_DIR="/opt/trassir-monitor"
 SELF_INSTALL_PATH="/usr/local/bin/trassir-monitor"
-REPO_RAW_BASE="https://raw.githubusercontent.com/naumenis-code/TRASSIR-Monitor/main"
+REPO_RAW_BASE="https://raw.githubusercontent.com/scp-oss/TRASSIR-Monitor/main"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
 
@@ -418,7 +418,7 @@ _fetch_latest_main_commit() {
     raw=$(curl -sS --connect-timeout 8 --max-time 12 \
         -H "Accept: application/vnd.github+json" \
         -w '\nHTTPSTATUS:%{http_code}' \
-        "https://api.github.com/repos/naumenis-code/TRASSIR-Monitor/commits/main" 2>/dev/null)
+        "https://api.github.com/repos/scp-oss/TRASSIR-Monitor/commits/main" 2>/dev/null)
     code=$(echo "$raw" | tail -1 | sed 's/HTTPSTATUS://')
     [ "$code" != "200" ] && return
     body=$(echo "$raw" | sed '$d')

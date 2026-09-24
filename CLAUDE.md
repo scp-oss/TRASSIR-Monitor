@@ -1527,7 +1527,7 @@ already be installed and logged into). Wanted this directly in the
 launcher menu instead, for any module, before even installing anything.
 
 New `_fetch_latest_main_commit()` queries
-`api.github.com/repos/naumenis-code/TRASSIR-Monitor/commits/main`
+`api.github.com/repos/scp-oss/TRASSIR-Monitor/commits/main`
 **once per launcher invocation**, cached in `_LATEST_MAIN_COMMIT` and
 reused for every subsequent `show_menu()` redraw in that same run —
 querying it on every redraw (returning to the menu after any action)
