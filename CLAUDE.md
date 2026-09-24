@@ -1517,6 +1517,63 @@ a real 403 would produce shows up right under the module in the menu,
 which is the whole point: no more needing to catch the message live
 during install.
 
+## Launcher shows a green "new version available" note per module (2026-09-24)
+
+Direct follow-up to the two entries above: once a person can actually
+see the real installed commit (and, if unknown, why), the natural next
+question is "is that the latest?" — previously answerable only via
+`/settings`'s "Проверить обновления" button (requires the dashboard to
+already be installed and logged into). Wanted this directly in the
+launcher menu instead, for any module, before even installing anything.
+
+New `_fetch_latest_main_commit()` queries
+`api.github.com/repos/naumenis-code/TRASSIR-Monitor/commits/main`
+**once per launcher invocation**, cached in `_LATEST_MAIN_COMMIT` and
+reused for every subsequent `show_menu()` redraw in that same run —
+querying it on every redraw (returning to the menu after any action)
+would burn through the same 60-req/hour unauthenticated GitHub API
+budget documented elsewhere in this file, for zero benefit since the
+answer can't have changed mid-session anyway.
+
+**Deliberately does not use `python3`** to parse the JSON, unlike the
+three installers' own commit-stamping step — the launcher has to work
+correctly on a server where *nothing* is installed yet (that's its
+whole first-run purpose), so it can't assume even system `python3` is
+present, only `curl`/`grep`/`sed` (already used elsewhere in this same
+file for the `HTTPSTATUS` split). Extraction: `grep -m1` for the first
+`"sha": "..."` occurrence (GitHub's JSON always puts the commit's own
+top-level `sha` before the nested `commit.tree.sha`/`parents[].sha`,
+so the first match is the right one) piped through `sed` to pull out
+just the hex string inside the quotes.
+
+**Caught by testing before this ever reached the real regex's final
+form**: the first version matched hashes with a hardcoded
+`grep -oE '[0-9a-f]{40}'` (SHA-1's fixed length) as a second pass after
+the first grep — worked against a *real* GitHub response, but a
+synthetic 39-character test fixture (a typo in the test data, not a
+real GitHub answer) silently matched nothing and returned an empty
+string, with no error either. Not just a test-fixture bug worth
+shrugging off — hardcoding `{40}` would have the exact same silent-empty
+failure mode against any *real* future GitHub SHA format change (e.g.
+if GitHub ever moves to SHA-256, a real possibility floated upstream in
+git itself). Switched to `sed -E 's/.*"([0-9a-f]+)"$/\1/'`, which
+extracts whatever hex run is actually there regardless of length —
+verified against both the original 40-char fixture and the (corrected)
+one.
+
+`_module_line()` now builds its base text via `printf -v` into a plain
+variable (no color codes inside the format string) and only appends
+the green `→ доступна новая версия: <hash>` suffix via `echo -e`
+afterward — kept deliberately separate from `printf`'s format-string
+color-code embedding trick used elsewhere in this file, to avoid
+depending on the fact that `printf`'s format argument happens to
+interpret backslash escapes that arrive via prior shell substitution.
+Shown only when all three are true: the latest commit was actually
+fetched, the module's own commit is known (not `?` — nothing to
+compare), and the two differ — silent otherwise, so an up-to-date
+module or one with no available comparison shows exactly what it did
+before this change.
+
 ## Telegram: способы отправки (прямо / прокси-SOCKS5 / свой relay) — и почему в коде нет вшитого чужого домена
 
 Запрос: добавить в Telegram-бот несколько способов отправки — напрямую,

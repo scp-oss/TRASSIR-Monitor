@@ -402,6 +402,37 @@ _git_short_commit() {
 }
 _LOCAL_COMMIT=$(_git_short_commit "$SCRIPT_DIR")
 
+# Последний коммит main на GitHub — запрашивается ОДИН РАЗ за весь
+# запуск лаунчера (до входа в цикл меню ниже, не внутри show_menu()),
+# чтобы возврат в меню после каждого действия не тратил впустую лимит
+# GitHub API (60 запросов/час без токена на IP — та же цифра, что уже
+# упоминается у диагностики install-*.sh). Только grep/sed, БЕЗ
+# python3 — в отличие от install-*.sh, лаунчер обязан отработать и на
+# самом первом запуске, ДО того как что-либо (включая venv/python3)
+# вообще установлено. Пусто при любой ошибке (сеть, лимит) — тогда
+# просто не показываем "доступна новая версия" нигде, это не
+# критичная функция, ломать из-за неё меню нельзя.
+_LATEST_MAIN_COMMIT=""
+_fetch_latest_main_commit() {
+    local raw code body sha_full
+    raw=$(curl -sS --connect-timeout 8 --max-time 12 \
+        -H "Accept: application/vnd.github+json" \
+        -w '\nHTTPSTATUS:%{http_code}' \
+        "https://api.github.com/repos/naumenis-code/TRASSIR-Monitor/commits/main" 2>/dev/null)
+    code=$(echo "$raw" | tail -1 | sed 's/HTTPSTATUS://')
+    [ "$code" != "200" ] && return
+    body=$(echo "$raw" | sed '$d')
+    # Первое совпадение "sha" в JSON — это верхнеуровневый sha самого
+    # коммита (идёт раньше вложенных commit.tree.sha/parents[].sha в
+    # ответе GitHub), поэтому -m1 достаточно без разбора JSON целиком.
+    # Длина хеша НЕ зашита в регулярку (было {40} — сломалось бы, если
+    # GitHub когда-либо сменит алгоритм) — sed просто вырезает то, что
+    # реально оказалось внутри кавычек после "sha":.
+    sha_full=$(echo "$body" | grep -m1 -oE '"sha"[[:space:]]*:[[:space:]]*"[0-9a-f]+"' | sed -E 's/.*"([0-9a-f]+)"$/\1/')
+    _LATEST_MAIN_COMMIT="${sha_full:0:7}"
+}
+_fetch_latest_main_commit
+
 # ============================================
 # ГЛАВНОЕ МЕНЮ
 # ============================================
@@ -411,10 +442,18 @@ _LOCAL_COMMIT=$(_git_short_commit "$SCRIPT_DIR")
 # неустановленного модуля — "?" рядом с [false] был бы шумом, а не
 # информацией.
 _module_line() {
-    local num="$1" check_fn="$2" label="$3" module="$4" status commit err
+    local num="$1" check_fn="$2" label="$3" module="$4" commit err base update_note
     if "$check_fn" >/dev/null 2>&1; then
         commit="$(_read_installed_commit "$module")"
-        printf "%-3s [%-5s] %s (коммит: %s)\n" "$num" "true" "$label" "$commit"
+        printf -v base "%-3s [%-5s] %s (коммит: %s)" "$num" "true" "$label" "$commit"
+        update_note=""
+        # Показываем только когда реально знаем ОБЕ версии и они разные —
+        # у "?" сравнивать не с чем, а если коммит и так последний, лишний
+        # текст только шумит.
+        if [ -n "$_LATEST_MAIN_COMMIT" ] && [ "$commit" != "?" ] && [ "$commit" != "$_LATEST_MAIN_COMMIT" ]; then
+            update_note="  ${GREEN}→ доступна новая версия: ${_LATEST_MAIN_COMMIT}${NC}"
+        fi
+        echo -e "${base}${update_note}"
         if [ "$commit" = "?" ]; then
             err="$(_read_commit_error "$module")"
             [ -n "$err" ] && echo -e "        ${YELLOW}└─ $err${NC}"
