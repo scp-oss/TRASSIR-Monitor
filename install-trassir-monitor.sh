@@ -531,6 +531,45 @@ def _read_installed_commit(module):
         return "?"
 
 
+def _read_commit_error(module):
+    """
+    Причина, по которой install-*.sh не смог зафиксировать коммит для
+    этого модуля в прошлый раз (лимит запросов к GitHub API, сеть и
+    т.п.) — тот же .error-файл, что теперь читает и
+    launcher-trassir-monitor.sh (см. его же _read_commit_error и
+    комментарий там). Раньше эта причина была видна только в консоли
+    ВО ВРЕМЯ установки — здесь она нужна, чтобы /api/version/check
+    могла объяснить "?", а не просто промолчать про модуль (см. её
+    докстрингу ниже, было "continue" без единого слова почему).
+    """
+    path = os.path.join(BASE_DIR, "data", f".installed_commit_{module}.error")
+    try:
+        with open(path) as f:
+            return f.read().strip() or None
+    except Exception:
+        return None
+
+
+def _module_ever_installed(module):
+    """
+    Реально ли модуль установлен на диске — та же проверка, что уже
+    использует /api/services/status и главная страница /settings
+    (наличие app/tg_bot.py, app/mail_bot.py), а не факт наличия
+    зафиксированного коммита (тот отдельно может быть "?" у РЕАЛЬНО
+    установленного модуля — см. check_version()). dashboard всегда
+    True: раз этот код вообще исполняется, дашборд по определению
+    установлен.
+    """
+    if module == "dashboard":
+        return True
+    if module == "telegram":
+        return os.path.exists(os.path.join(BASE_DIR, "app", "tg_bot.py")) or \
+               os.path.exists(os.path.join(BASE_DIR, "app", "tg_proxy_bot.py"))
+    if module == "mail":
+        return os.path.exists(os.path.join(BASE_DIR, "app", "mail_bot.py"))
+    return False
+
+
 def _get_build_info():
     """
     Информация о версии для футера дашборда/настроек — тот же принцип,
@@ -2308,12 +2347,17 @@ def check_version():
     проект не хранит нигде отдельно "какая версия сейчас самая
     новая" — она попросту равна тому, что лежит в main в момент вызова.
 
-    Модуль считается неустановленным (и не попадает в ответ), если для
-    него ещё никогда не фиксировался коммит — то есть либо он реально
-    не установлен, либо установлен версией до появления этой фичи
-    (тогда ответ будет "?" для installed, что тоже показывается как
-    "не удалось определить", а не как "нужно обновление" — путать
-    "не знаем" с "устарело" было бы хуже, чем оставить как есть).
+    Модуль с ещё никогда не зафиксированным коммитом (реально не
+    установлен, установлен версией до появления этой фичи, или
+    install-*.sh не смог достучаться до GitHub API в прошлый раз) всё
+    равно попадает в ответ с installed="?", но теперь ещё и с
+    install_error — причиной последнего сбоя фиксации, если она
+    известна (см. _read_commit_error). Раньше такой модуль просто
+    молча пропускался ("continue") — на экране он неотличим от
+    "модуль вообще не установлен", хотя на деле это два разных случая
+    с разными действиями (переустановить vs подождать лимит GitHub).
+    up_to_date для такого модуля не считается вообще (None) — сравнивать
+    "?" с чем-либо бессмысленно, это не "устарело" и не "актуально".
     """
     if not session.get("logged_in"):
         return jsonify({"ok": 0, "error": "Требуется авторизация"}), 403
@@ -2333,6 +2377,14 @@ def check_version():
     for module, label in (("dashboard", "Дашборд"), ("telegram", "Telegram"), ("mail", "Email")):
         installed = _read_installed_commit(module)
         if installed == "?":
+            if not _module_ever_installed(module):
+                continue
+            modules[module] = {
+                "label": label,
+                "installed": "?",
+                "up_to_date": None,
+                "install_error": _read_commit_error(module)
+            }
             continue
         modules[module] = {
             "label": label,
@@ -5048,6 +5100,15 @@ async function checkForUpdates() {
             return;
         }
         var lines = mods.map(function(m) {
+            if (m.up_to_date === null) {
+                // installed="?" — модуль установлен, но install-*.sh не
+                // смог зафиксировать коммит в прошлый раз (см.
+                // install_error). Не "нужно обновление" и не "актуально" —
+                // отдельное третье состояние, раньше такой модуль вообще
+                // не попадал в этот список.
+                var reason = m.install_error ? ' — ' + escapeHtml(m.install_error) : '';
+                return '❔ ' + escapeHtml(m.label) + ': версия не определена' + reason;
+            }
             return m.up_to_date
                 ? '✅ ' + escapeHtml(m.label) + ': последняя версия (' + escapeHtml(m.installed) + ')'
                 : '🔄 ' + escapeHtml(m.label) + ': доступно обновление (сейчас ' + escapeHtml(m.installed) + ', актуальный ' + escapeHtml(d.latest_commit) + ')';
@@ -5595,18 +5656,31 @@ except Exception:
 " 2>/dev/null)
 fi
 
+COMMIT_ERROR_FILE="$INSTALL_DIR/data/.installed_commit_dashboard.error"
 if [ -n "$LATEST_COMMIT" ]; then
     echo "$LATEST_COMMIT" > "$INSTALL_DIR/data/.installed_commit_dashboard"
+    rm -f "$COMMIT_ERROR_FILE"
     echo "    ✓ Версия зафиксирована: $LATEST_COMMIT"
 else
     echo -e "    ${YELLOW}⚠ Не удалось определить версию через GitHub API (HTTP ${GITHUB_HTTP_CODE:-нет ответа}) — версия будет показываться как '?'${NC}"
     if [ "$GITHUB_HTTP_CODE" = "403" ]; then
+        COMMIT_ERROR_REASON="HTTP 403 — похоже на лимит запросов к GitHub API (60/час без токена на IP), попробуйте обновить позже"
         echo -e "    ${YELLOW}Похоже на лимит запросов к GitHub API (60/час без токена на один IP) — попробуйте обновить позже.${NC}"
     elif [ "$GITHUB_HTTP_CODE" = "000" ] || [ -z "$GITHUB_HTTP_CODE" ]; then
+        COMMIT_ERROR_REASON="HTTP 000 — api.github.com не ответил (сеть/DNS, это отдельный сервис от raw.githubusercontent.com)"
         echo -e "    ${YELLOW}api.github.com не ответил вовсе (не то же самое, что raw.githubusercontent.com,${NC}"
         echo -e "    ${YELLOW}который только что успешно скачал этот же скрипт — разные сервисы GitHub).${NC}"
+    else
+        COMMIT_ERROR_REASON="HTTP ${GITHUB_HTTP_CODE:-?} — неожиданный ответ GitHub API"
     fi
     echo -e "    ${YELLOW}(не мешает работе дашборда, только отображению версии/проверке обновлений)${NC}"
+    # Причина пишется на диск, а не только в консоль — "Update all" в
+    # лаунчере не всегда смотрят вживую (вывод легко проматывается), а
+    # само "коммит: ?" в меню ничего не объясняет. Читается
+    # launcher-trassir-monitor.sh (_read_commit_error) и здесь же в
+    # app.py (/api/version/check) — оба места, где эта же "?" уже
+    # показывалась совсем без зацепки, почему.
+    echo "$(date '+%Y-%m-%d %H:%M:%S') $COMMIT_ERROR_REASON" > "$COMMIT_ERROR_FILE"
 fi
 
 # ============================================

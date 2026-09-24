@@ -1450,6 +1450,73 @@ hypothesis), and a totally unreachable host (correctly reports `000`/no
 response rather than misreporting it as a generic identical-looking
 failure).
 
+## The 403/000 diagnostic above only ever reached a terminal, never a file — persisted it (2026-09-24)
+
+Live follow-up: even after the diagnostic above shipped, a user still
+saw `коммит: ?` in the launcher menu for a module and had no visible
+reason why — because the actual diagnostic line (`403`/`000`/etc.) only
+ever gets printed to stdout *during* that one install/update run.
+`launcher-trassir-monitor.sh`'s `_run_installer()` runs the installer
+with output going straight to the terminal (never redirected), so the
+message genuinely was shown — but "Update all" scrolls a lot of text
+past, and if nobody is watching the screen at that exact moment (or
+it's launched non-interactively), the reason is gone forever the moment
+the terminal scrolls or the session ends. The menu itself, which is the
+one place a person actually goes back to look at `коммит: ?`, never
+carried any explanation — same "diagnostic exists but nobody catches it
+live" shape as several other incidents in this file
+(`z2r_autobench`'s `zenith_autorun.sh` never checking exit codes,
+`Zenith`'s swallowed subprocess stderr) — worth grepping for this
+pattern (a diagnostic that only ever goes to a scrolling console,
+nowhere persisted) whenever a "still can't see why" report comes back
+after a diagnostic was already added.
+
+Also found while touching this: `install-telegram-notifier.sh` and
+`install-mail-notifier.sh` never got the `000`/no-response branch from
+the entry above — only `install-trassir-monitor.sh` did. Same class of
+drift this file keeps warning about (a fix landing in one copy of
+near-identical logic, not grepped into its siblings) — fixed all three
+in the same pass.
+
+**Fix**: each installer's version-stamp step now also writes the
+failure reason to `data/.installed_commit_<module>.error` (timestamp +
+HTTP code + the same human explanation already printed to console) —
+cleared (`rm -f`) the moment a stamp actually succeeds, so a fixed
+problem can't leave a stale reason lying around to confuse a later
+look. Two places now surface it instead of requiring a live terminal:
+- `launcher-trassir-monitor.sh`: new `_read_commit_error(module)`
+  mirrors `_read_installed_commit`; `_module_line()` prints it as a
+  `└─` sub-line right under the module, but *only* when the commit is
+  still `?` — a module with a real hash shown never gets this extra
+  line, so nothing changes for the common case.
+- `app.py`'s `/api/version/check`: previously did a bare `continue` for
+  any module with `installed == "?"` — indistinguishable in the
+  response from "not installed at all," and the *reason* for the
+  unknown version was never exposed anywhere on the dashboard side.
+  Now checks `_module_ever_installed(module)` (same `os.path.exists`
+  check `/api/services/status` already uses for `tg_bot.py`/
+  `mail_bot.py`) — a genuinely uninstalled module still doesn't appear;
+  an installed-but-unstamped one now appears with `installed: "?"`,
+  `up_to_date: null` (a real third state — distinct from `true`/`false`,
+  comparing "?" against anything would be meaningless), and
+  `install_error` when a reason is on record. `checkForUpdates()` in
+  `settings.html` grew a branch for `up_to_date === null` specifically
+  (the old `m.up_to_date ? ... : ...` ternary would have silently
+  treated `null` as falsy and wrongly claimed "update available, `?` →
+  `<hash>`" — checked for this explicitly rather than assuming the
+  existing two-way branch would degrade gracefully).
+
+Verified end-to-end via `test_client()`: a module with a real stamped
+commit unaffected; a module with a `.error` file present returns it
+verbatim in `install_error`; a module that was never installed at all
+(no marker, no error file, `tg_bot.py`/`mail_bot.py` absent) correctly
+stays out of the response entirely, same as before this change. Also
+manually rendered `_module_line()`'s new sub-line output directly (bash
+snippet, not the full launcher) — confirms the exact `└─ <reason>` text
+a real 403 would produce shows up right under the module in the menu,
+which is the whole point: no more needing to catch the message live
+during install.
+
 ## Telegram: способы отправки (прямо / прокси-SOCKS5 / свой relay) — и почему в коде нет вшитого чужого домена
 
 Запрос: добавить в Telegram-бот несколько способов отправки — напрямую,

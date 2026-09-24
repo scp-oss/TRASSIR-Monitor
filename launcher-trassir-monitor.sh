@@ -74,6 +74,20 @@ _read_installed_commit() {
     fi
 }
 
+# Причина, по которой install-*.sh НЕ смог зафиксировать коммит в
+# прошлый раз (лимит запросов к GitHub API, сеть и т.п.) — install-*.sh
+# пишет её сюда рядом с самим маркером (см. "Определение установленной
+# версии" в каждом install-*.sh), а раньше это было видно только в
+# консоли ВО ВРЕМЯ установки/обновления и терялось, если человек не
+# смотрел на экран именно в этот момент — "коммит: ?" в меню само по
+# себе ничего не объясняет. Файл удаляется установщиком при следующей
+# УСПЕШНОЙ фиксации коммита, так что старая причина не может пережить
+# и запутать после реального исправления.
+_read_commit_error() {
+    local module="$1" path="$INSTALL_DIR/data/.installed_commit_${module}.error"
+    [ -f "$path" ] && cat "$path" 2>/dev/null
+}
+
 _press_enter() {
     echo ""
     read -p "Press Enter to return to the menu... " _dummy
@@ -397,9 +411,14 @@ _LOCAL_COMMIT=$(_git_short_commit "$SCRIPT_DIR")
 # неустановленного модуля — "?" рядом с [false] был бы шумом, а не
 # информацией.
 _module_line() {
-    local num="$1" check_fn="$2" label="$3" module="$4" status
+    local num="$1" check_fn="$2" label="$3" module="$4" status commit err
     if "$check_fn" >/dev/null 2>&1; then
-        printf "%-3s [%-5s] %s (коммит: %s)\n" "$num" "true" "$label" "$(_read_installed_commit "$module")"
+        commit="$(_read_installed_commit "$module")"
+        printf "%-3s [%-5s] %s (коммит: %s)\n" "$num" "true" "$label" "$commit"
+        if [ "$commit" = "?" ]; then
+            err="$(_read_commit_error "$module")"
+            [ -n "$err" ] && echo -e "        ${YELLOW}└─ $err${NC}"
+        fi
     else
         printf "%-3s [%-5s] %s\n" "$num" "false" "$label"
     fi
