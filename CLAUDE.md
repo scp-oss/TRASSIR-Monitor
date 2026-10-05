@@ -1723,6 +1723,67 @@ HTTP-прокси в `install-telegram-notifier.sh` — прокси **всег�
 через `node --check` + прогон с моковым `escapeHtml`) — все проверки
 прошли.
 
+## "Тест" button showed a bare ❌ with no text — send_telegram_message() never returned WHY (2026-10-05)
+
+Live report: a user configured the "свой relay/worker" transport
+(custom domain + auth key, see the section above) and the "Тест" button
+showed just a red ❌ with nothing next to it — completely
+content-free. Confirmed by reading `renderTelegram()`'s
+`testTelegram()`: `'❌ ' + escapeHtml(d.error)` — `escapeHtml(undefined)`
+returns `''`, so a response with no `error` key renders exactly this
+symptom. Two independent, stacked bugs, both pre-existing (not
+introduced by the multi-transport work above, just never surfaced until
+a transport other than direct `api.telegram.org` actually failed in a
+way worth looking at):
+
+1. **`send_telegram_message()`'s every failure branch only `print()`ed
+   its reason to the bot's own log — never returned it.** Caller only
+   ever got a bare `True`/`False`. This is the exact "swallowed
+   subprocess/response detail behind a bare bool" class of bug this
+   whole multi-repo engagement keeps hitting (see `z2r_autobench`'s and
+   `Zenith`'s own `CLAUDE.md` for several unrelated instances of the
+   identical shape) — once again, a bug that's invisible right up until
+   something that used to always succeed (direct `api.telegram.org`)
+   starts failing in a more varied way (a custom relay can 404, return
+   HTML instead of JSON, 401 on a bad key, etc. — many more failure
+   shapes than "Telegram is just down").
+2. **`/api/telegram/test` compounded it**: on failure it returned a bare
+   `{"ok": 0}` with no `error` key at all (even if `send_telegram_message`
+   *had* returned a reason, this route had nowhere to put it) — and on
+   *success* it returned `{"ok": 1}` with no `message` key either, so
+   `testTelegram()`'s success branch (`'✅ ' + escapeHtml(d.message)`)
+   would have shown an equally content-free "✅ " with nothing after it,
+   just never noticed because success doesn't prompt anyone to go
+   looking for missing text.
+
+**Fix**: new module-level `LAST_SEND_ERROR` string in `tg_bot.py`,
+set (and cleared on success) in every branch of `send_telegram_message()`
+— timeout, proxy error, connection error, non-200 HTTP (now includes the
+response body, truncated to 200 chars — the single most useful bit for
+a custom relay: a 404 body says "wrong path", a 401/403 body says "bad
+key", an HTML error page says "this isn't really a Bot API endpoint at
+all"), a 200 response that isn't even JSON (same relay-is-wrong-shape
+case, caught explicitly via `ValueError` from `.json()` instead of
+leaking an unhandled exception), and genuine Telegram API-level
+rejections (`result.get('description')`, unchanged, now just actually
+reaches the caller). `/api/telegram/test` reads `mod.LAST_SEND_ERROR`
+on failure and puts it in the response's `error` field (falling back to
+a generic "причина не определена" string only if that's somehow still
+empty — defensive, not expected to trigger), and always includes a
+`message` on success.
+
+Verified both at the `send_telegram_message()` level directly (a mocked
+404 response with a body → `LAST_SEND_ERROR` contains both the code and
+the body text) and end-to-end through `/api/telegram/test` via
+`test_client()` (same mocked failure surfaces verbatim in the JSON
+`error` field the frontend reads; the success path now carries a
+non-empty `message` too). This does NOT diagnose any specific user's
+custom relay being broken — it only makes sure that whatever the real
+reason is (wrong path, wrong auth scheme, relay down, relay not
+actually forwarding to real Telegram) is now visible in the UI instead
+of a bare ❌, which is what's actually needed to diagnose a third-party
+relay this project has no visibility into otherwise.
+
 ## Publishing hygiene
 
 Public repo. Never commit real server hostnames/IPs, ISP/provider names,
