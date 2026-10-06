@@ -2224,6 +2224,117 @@ doesn't remove it for real problems) and a camera recovery with its
 own `recovery_msg` (confirms `⚠` is now absent and exactly one `✅`
 remains on the line, matching what the report asked for).
 
+## Live incident: a stale local install-trassir-monitor.sh silently wiped a real database, with no backup (2026-10-06)
+
+**What happened, in order:**
+1. A real update run on a live server correctly detected update mode,
+   backed up `data/` (165MB) + `static/` to a temp dir, wiped
+   `$INSTALL_DIR`, and restored both — all correct, this is the current
+   `v13.0` code's own safety net working exactly as designed.
+2. That same run then hung during `pip install` — `pypi.org` was
+   completely blocked from this specific hosting provider (TCP connect
+   timeout, not a DNS error — same shape as this engagement's other
+   projects hitting provider-specific GitHub blocks) — but the
+   *first* pip attempt runs with `-q 2>/dev/null`, so a slow-but-maybe-
+   working connection and a fully dead one look *identical*: total
+   silence. That silence was misread as a hang and interrupted.
+3. The suggested recovery (`sed` the `pypi.org` URL to a mirror, then
+   `sudo bash install-trassir-monitor.sh` directly) operated on
+   whatever file happened to be named that in the current shell — which
+   turned out to be an **old `v12.0` copy**, not the one actually just
+   used in step 1. Running it did a plain, unconditional fresh-install
+   flow: no update-mode detection, no `DATA_PRESERVE_DIR`, straight
+   `rm -rf $INSTALL_DIR`. The just-restored 165MB database was gone,
+   with nothing to recover from (`/tmp` had no leftover preserve-dir —
+   the *correct* v13.0 run that created one had already cleaned up
+   after itself on success).
+4. Still not isolated to that one bad command: going through the
+   **launcher's own "Install Dashboard" menu item** reproduced the
+   identical `v12.0` banner. Root cause: `do_install_dashboard()` (and
+   every other install-menu action) called `_run_installer` with
+   `force_fresh` defaulting to `0` — "prefer whatever file already
+   sits next to the launcher" — a deliberate design for the genuinely
+   offline case (someone `git clone`d the whole repo), but applied
+   indiscriminately to a **fresh install action**, which has every
+   reason to want the actual current code and no reason to trust an
+   unrelated old file that happened to be sitting in the same
+   directory. Worse: this path returned silently — zero log line
+   anywhere said "using local copy" versus "downloaded fresh", so
+   there was no way to notice the staleness before it mattered. Only
+   `"5. Update all"` had ever been fixed to pass `force_fresh=1`.
+
+**Net effect**: a real production database (server list, alert
+history, Telegram/Email config, admin password) is gone, unrecoverable
+from anything this session had access to. This is not a hypothetical
+near-miss — logged here as a real loss, not a "bug that was caught in
+time."
+
+**Fixes, three independent layers (any one alone would have prevented
+this; all three now in place together):**
+
+1. **`install-trassir-monitor.sh`: `pypi.org` unreachable no longer
+   looks identical to "working but slow," and no longer requires
+   manually editing the installer to recover.** New `_pip_install()`
+   (one shared function, replacing nine separate copies of the same
+   `pip install ... -q 2>/dev/null || pip install ... (loud)` pattern —
+   same "don't duplicate retry logic nine times" principle already
+   applied elsewhere in this file) tries, in order: `pypi.org` quiet →
+   `pypi.org` loud with a longer timeout (visible progress once it's
+   clear the quiet attempt didn't finish fast) → `mirror.yandex.ru`
+   quiet → `mirror.yandex.ru` loud. Only if literally all four fail
+   does it give up, with an explicit final error naming the exact
+   packages and the two `curl` commands to check manually — never a
+   silent partial environment. This closes the "manually `sed` the
+   wrong file to work around a block" step entirely — the installer
+   now tries the mirror on its own.
+2. **`launcher-trassir-monitor.sh`: install actions (items 1/2/3) now
+   pass `force_fresh=1`**, matching what `"Update all"` already did —
+   an install, same as an update, has no legitimate reason to prefer
+   an unrelated old file over the real current code. `force_fresh=0`
+   (prefer local, no network) is now used *only* for uninstall actions,
+   where a stale version is far lower-risk (mostly the same
+   `rm -rf`/`systemctl stop` regardless of age) and offline capability
+   matters more (you may be uninstalling specifically because
+   something's broken).
+3. **Every path through `_get_script()` now announces its source out
+   loud, unconditionally** — new `_script_version_suffix()` greps the
+   resolved file's own `TRASSIR Monitor vN.N` string and appends it to
+   every "using local copy" / "could not download, falling back"
+   message. Previously only the *fallback-after-failed-download* branch
+   printed anything; the plain "local file was already sitting there,
+   use it directly" branch (the one actually hit in this incident)
+   returned in total silence. This is the fix that would have made the
+   *symptom* visible at the exact moment it mattered — `v12.0` printed
+   right there in the log, impossible to miss, instead of only showing
+   up three menu-screens later in the install banner.
+
+**Deliberately not done**: did not remove the local-sibling-preference
+mechanism itself, or make `force_fresh=1` universal — the genuinely
+offline, whole-repo-cloned use case this was built for (see the
+original `_get_script()` comment) is real and still needs to work
+without a network. The fix is narrower: stop defaulting to it for
+actions where "get the current code" is the obvious intent, and never
+let *any* branch run silently again.
+
+Verified with the real extracted functions (not hand-retyped copies —
+same standing lesson this file keeps re-learning about a test that
+only exercises code through one accidental path), mocked `curl`/`pip`:
+confirmed `force_fresh=1` with a working mock download ignores a
+stale local file entirely and cleans up its own temp file afterward
+without ever touching the local sibling; `force_fresh=1` with a failing
+mock download falls back to the local file *and* prints its real
+version in the warning; `force_fresh=0` (the uninstall path) now also
+prints which file and version it's using instead of returning silently;
+an unrecognized/non-matching file honestly reports "version not
+determined" rather than guessing. `_pip_install()` verified separately
+with a mocked `pip`: a `pypi.org`-blocked-but-mirror-working case falls
+through and succeeds, a fully-working `pypi.org` case never touches the
+mirror at all (silent, fast, unchanged for everyone not affected by
+this), a fully-blocked case produces the exact final diagnostic
+message, and a multi-package call (`gevent gevent-websocket`) is
+confirmed to reach `pip` as separate argv entries, not one mangled
+string.
+
 ## Publishing hygiene
 
 Public repo. Never commit real server hostnames/IPs, ISP/provider names,
