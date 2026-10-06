@@ -2052,6 +2052,138 @@ JS was verified with `node --check` plus a mocked-DOM functional run
 covering XSS-escaping of a hostile server name, correct ✅/❌ rendering,
 and correct per-version download-link generation.
 
+## Backup+restore of the MONITOR's own config (servers/Telegram/Email) — distinct from the SDK registrator-settings backup above (2026-10-06)
+
+Direct follow-up, same session as the SDK `/settings/` config-backup
+feature above: the user clarified the actual priority is narrower and
+different — "по сути нам нужно бекапить только Список серверов Telegram
+уведомления и Email уведомления, а база ошибок... её не нужно
+сохранять" (essentially only the server list + Telegram + Email need
+backing up; the alerts/health history doesn't, it just regenerates). This
+is backing up **this monitor's own configuration**, not TRASSIR's — a
+completely different, much lower-risk target than the SDK-tree feature
+above (that one talks to a live third-party device over the network;
+this one only ever reads/writes this app's own SQLite DB and one local
+`config.ini`). Left the SDK-tree feature in place since it's unrelated
+and harmless, rather than assuming "narrower ask" meant "remove the
+other thing" — flagged back to the user to confirm.
+
+**What actually needs backing up, and where it really lives** (checked
+by reading the code, not assumed):
+- `servers` table — already has a working export/import
+  (`/api/servers/export`/`import`) from a prior session; reused its
+  core merge-by-name logic rather than writing a second copy of it (see
+  below).
+- Telegram: the **bot token itself lives in `config.ini` on disk**
+  (`$BASE_DIR/config.ini`, `[telegram]` section — `token`/`proxy`/
+  `monitor_url`), written by `install-telegram-notifier.sh`, NOT in the
+  SQLite DB at all. `telegram_chats` (recipients) and `telegram_settings`
+  (transport overrides — `proxy_url`/`api_base`/`api_key`, see the
+  multi-transport feature earlier in this file) ARE in the DB. A backup
+  that only touched the DB would silently miss the token — the single
+  most important piece of "Telegram notifications" to restore.
+- Email: everything (SMTP server/port/user/**password**, from-name,
+  recipients, `enabled`/`notify_interval`) lives in the DB
+  (`mail_settings`/`mail_recipients`) — no external file at all, unlike
+  Telegram. Simpler to back up than Telegram for exactly this reason.
+
+**Implementation**: `_collect_app_backup_data()` gathers all three into
+one dict; `backup_app_settings()` writes it to `data/app_backups/
+app_backup_<timestamp_with_microseconds>.json` and prunes to
+`APP_BACKUP_KEEP` (5) — same microsecond-timestamp lesson already
+learned the hard way for the SDK-tree feature, applied here from the
+start instead of re-discovering it. Scheduled at 03:15 (`backup_server_
+settings` stays at 03:30 — the two are independent, no reason to
+collide them), plus a manual "Снять бэкап сейчас" button
+(`POST /api/app-backup/run`). **Deliberately does not include health/
+alerts history** — exactly the one thing the user said doesn't need
+saving, and also the one thing that's genuinely safe to regenerate from
+nothing (it's just a rolling observation log, not configuration).
+
+**Restore was built this time, unlike the SDK-tree feature** — and this
+is the key difference that makes it safe to do here but not there: this
+backup is entirely this app's OWN state. Worst case of a bad restore is
+"my own settings are wrong," fixable by re-editing through `/settings`
+or restoring a different backup — nothing like writing an unverified
+value tree into a live third-party TRASSIR server's running config.
+`_restore_app_settings(data)`:
+- **Servers/chats/recipients: merge, never delete.** Matched by natural
+  key (server name / `chat_id` / `email`) — update if found, insert if
+  not, nothing present-but-not-in-the-backup ever gets removed. Reused
+  by extracting `_import_servers_rows(conn, data)` out of the existing
+  `import_servers()` route instead of writing a second, separately-
+  maintained copy of the same merge logic — this project's own
+  CLAUDE.md (several entries, this repo and sibling repos') has hit the
+  "two copies of the same logic quietly drift apart" bug enough times
+  that avoiding it here was a deliberate, not incidental, choice.
+- **`telegram_settings`/`mail_settings` (key→value "current config"
+  tables) and `config.ini`: full overwrite**, not merge — there's no
+  list to merge, a setting either has the backup's value or it doesn't.
+  `config.ini` is only touched if the backup actually has a non-empty
+  token (an old backup predating Telegram being configured, or a
+  partial hand-edited file, won't blank out a token that's since been
+  set) — read via the same two-candidate-filename check
+  (`config_tgproxy.ini`/`config.ini`) the existing `/api/telegram/
+  settings` GET handler already uses, so restore writes to whichever
+  file is actually live instead of guessing.
+- Returns a per-category summary (added/updated counts, whether
+  `config.ini`/settings tables were touched) — shown to the user after
+  restore instead of a bare "success", so a restore that silently did
+  less than expected (e.g. the backup had no Telegram token) is visible
+  immediately rather than discovered later when notifications don't
+  work.
+
+**Security note, found by the test harness, not by inspection**: the
+restore button's UI used `JSON.stringify(b.filename)` to build an
+inline `onclick="restoreAppBackup('...')"` attribute. `JSON.stringify`
+only escapes for *JavaScript string* syntax (quotes, backslashes,
+control chars) — it does **not** escape for the *HTML attribute*
+context the result then gets embedded into. A filename containing a
+literal `"` would close the `onclick="..."` attribute early, turning
+whatever followed into real parsed HTML/script — the exact
+attribute-breakout class of XSS this project's own 2026-09-06
+XSS-hardening pass was written to close everywhere else. Today's
+filenames are server-generated and not attacker-controlled, so this
+wasn't exploitable *yet* — but same principle as the hardening pass:
+fix the class of bug, not just today's instance of it. Fixed with a
+small `jsStringToAttr()` helper that builds a proper single-quoted JS
+string literal (escaping `\` and `'` for JS validity) and *then*
+HTML-escapes `&`/`"` for the attribute context — two independent
+escaping passes for two independent contexts, which is the actual fix;
+`escapeHtml()` alone doesn't cover this (it never touches `"` at all,
+by design, since it's meant for `innerHTML` text content, not
+attribute values). Caught by writing the test as a real browser would
+parse it (`jsdom`, installed into the test scratch dir for this one
+verification — not a new project dependency, nothing added to the
+shipped code) instead of a naive substring check: the first attempt at
+this test used `!html.includes('<img ')` and incorrectly reported the
+*unpatched* code as safe, because that text is legitimately present as
+literal characters inside a correctly-bounded attribute value — a
+substring check can't distinguish "text inside an attribute" from "a
+real parsed tag," only an actual parser can. Verified both that the
+fix stops the attribute from breaking out (jsdom: exactly the expected
+number of `<button>` elements, zero injected `<img>` elements) and that
+it doesn't corrupt the legitimate value — clicking the button in a
+real parsed DOM passes back the exact original filename string,
+`"`/`&`/`<`/`>` and all.
+
+**Also verified**: path-traversal attempts against both
+`/api/app-backup/download/<filename>` and the `restore` route's
+`filename` body field (`../../../etc/passwd`, its URL-encoded form, and
+a bare absolute `/etc/passwd`) all resolve to a clean 404 — 
+`_resolve_app_backup_path()` strips to `os.path.basename()` first, then
+confirms the `os.path.realpath()`'d result still lives inside
+`APP_BACKUP_DIR` before ever touching the filesystem. A full restore
+round-trip was tested against a real SQLite DB + real `config.ini`: backup
+a populated state, wipe everything to simulate a post-reinstall empty
+DB, restore, confirm every field (including the SMTP password and the
+real Telegram token) came back exactly; then restored the *same* old
+backup a second time after adding one more server in between, confirming
+the newly-added server survived (merge, not wipe) alongside the
+restored one. All four new routes (`run`/`status`/`download`/`restore`)
+covered via `test_client()` including the auth-rejection and
+traversal-rejection cases above.
+
 ## Publishing hygiene
 
 Public repo. Never commit real server hostnames/IPs, ISP/provider names,
