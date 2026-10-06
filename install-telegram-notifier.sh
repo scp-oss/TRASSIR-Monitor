@@ -860,13 +860,21 @@ def format_alert_message(alert_data):
     arch_val = health.get('arch', '?')
     arch_str = f"{arch_val:.1f} дн" if isinstance(arch_val, (int, float)) else f"{arch_val} дн"
 
+    # Для восстановлений message (= recovery_msg) уже начинается со
+    # своего "✅" (см. формирование recovery_msg выше) — добавлять перед
+    # ним ещё и ⚠️ означает два противоречащих друг другу значка подряд
+    # на одной строке ("тревога" + "всё ок" одновременно), что и было
+    # живой жалобой. ⚠️ оставлен только для настоящих проблем, где он
+    # единственный значок на строке.
+    event_prefix = "" if is_recovery else f"{ICON_EVENT} "
+
     lines = [
         f"{emoji} <b>{header}</b>",
         "",
         f"{ICON_SERVER} <b>Сервер:</b> {server_name}",
         f"{ICON_IP} <b>IP адрес:</b> {server_ip}",
         "",
-        f"{ICON_EVENT} <b>Событие:</b> {message}",
+        f"{event_prefix}<b>Событие:</b> {message}",
     ]
 
     if downtime:

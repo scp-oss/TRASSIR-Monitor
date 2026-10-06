@@ -2184,6 +2184,46 @@ restored one. All four new routes (`run`/`status`/`download`/`restore`)
 covered via `test_client()` including the auth-rejection and
 traversal-rejection cases above.
 
+## Recovery Telegram messages showed ⚠️ right next to ✅ on the same line (2026-10-06)
+
+Live report with a screenshot: a camera-recovered notification's
+"Событие:" line read `⚠️ Событие: ✅ Камера восстановлена: #09
+Semeinaia` — two status icons that contradict each other (warning +
+all-clear) stacked on one line. Root cause in `tg_bot.py`'s
+`format_alert_message()`: the line template
+(`f"{ICON_EVENT} <b>Событие:</b> {message}"`) always prepends the
+constant `ICON_EVENT` (⚠, `⚠`) no matter what kind of event this
+is — and for a recovery, `message` is `alert_data['recovery_msg']`,
+which is built elsewhere (the bot's own alert-polling loop) already
+starting with its own `✅` (`f"✅ Камера восстановлена: {cam_name}"`,
+and four sibling cases for server/CPU/archive/disk recovery, all with
+the same hardcoded `✅` prefix). The two were never meant to combine —
+each was written assuming it was the only icon on the line.
+
+**Fix**: `event_prefix` is now `""` when `is_recovery`, keeping
+`ICON_EVENT` only for genuine problem alerts (where it's correctly the
+only icon on that line). Recovery messages already carry their own
+icon via `recovery_msg` — nothing else needed there.
+
+**Checked the mail notifier for the same bug, per this file's own
+standing rule about alert-message formatting being independently
+duplicated across both bots** — it does NOT have this problem:
+`install-mail-notifier.sh`'s own `recovery_msg` strings (`"Камера
+восстановлена: {cam_name}"`, etc.) are plain text with no baked-in
+emoji at all; the recovery icon there comes from a single, separate
+`classify_alert('info', 'восстановлен')` badge shown once in the
+email's header styling, never duplicated into the message body text.
+So this was a `tg_bot.py`-specific bug (its `recovery_msg` strings are
+the ones that include a hardcoded `✅`), not a shared template bug —
+no equivalent fix needed on the mail side.
+
+Verified by extracting the real `format_alert_message()` out of its
+heredoc and calling it directly with two fixtures: a genuine
+camera-offline warning (confirms `⚠` is still present — the fix
+doesn't remove it for real problems) and a camera recovery with its
+own `recovery_msg` (confirms `⚠` is now absent and exactly one `✅`
+remains on the line, matching what the report asked for).
+
 ## Publishing hygiene
 
 Public repo. Never commit real server hostnames/IPs, ISP/provider names,
