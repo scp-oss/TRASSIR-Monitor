@@ -481,7 +481,7 @@ import secrets
 import hmac
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
-from flask import Flask, jsonify, render_template, request, session, redirect, url_for, make_response
+from flask import Flask, jsonify, render_template, request, session, redirect, url_for, make_response, send_file
 from flask_cors import CORS
 from flask_socketio import SocketIO
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -496,6 +496,8 @@ TEMPLATE_DIR = os.path.join(BASE_DIR, "templates")
 DB_PATH = os.path.join(BASE_DIR, "data", "trassir.db")
 LOG_DIR = os.path.join(BASE_DIR, "logs")
 SECRET_KEY_PATH = os.path.join(BASE_DIR, "data", "secret_key.txt")
+CONFIG_BACKUP_DIR = os.path.join(BASE_DIR, "data", "config_backups")
+CONFIG_BACKUP_KEEP = 5  # сколько последних бэкапов на регистратор хранить
 APP_VERSION = "v13.0"
 
 # ============================================
@@ -777,7 +779,31 @@ def init_db():
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     """)
-    
+
+    # ============================================
+    # Таблица config_backups — история бэкапов настроек
+    # регистраторов, снятых через SDK /settings/
+    # (см. backup_server_settings()). Сам JSON лежит файлом на диске
+    # (data/config_backups/<server_id>/...), здесь только метаданные —
+    # settings-дерево может быть большим, незачем раздувать sqlite.
+    # Это НЕ то же самое, что родной бэкап TRASSIR Client'а
+    # (.settings-backup/.dump) — тот создаётся кнопкой в самом клиенте
+    # через порт управления, SDK туда не достаёт. Это JSON-снимок
+    # дерева настроек через /settings/, для просмотра/диагностики и
+    # восстановления значений вручную, не байт-в-байт родной формат.
+    # ============================================
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS config_backups (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            server_id INTEGER NOT NULL,
+            ts DATETIME DEFAULT CURRENT_TIMESTAMP,
+            ok BOOLEAN DEFAULT 1,
+            file_path TEXT DEFAULT '',
+            size_bytes INTEGER DEFAULT 0,
+            error TEXT DEFAULT ''
+        )
+    """)
+
     # ============================================
     # Таблица health — история здоровья серверов
     # ============================================
@@ -1157,7 +1183,63 @@ class TrassirClient:
                     print(f"  Проверено {i + 1}/{len(channels_list)} каналов...")
 
             return {"ok": 1, "channels": channels_status, "channels_by_guid": channels_by_guid}
-        
+
+        except Exception as e:
+            return {"ok": 0, "error": str(e)}
+
+    def get_settings(self):
+        """
+        Получает ПОЛНОЕ дерево настроек сервера через SDK-эндпоинт
+        /settings/ — сеть, IP-камеры, архив, COM-порты, скриншоты и т.д.
+        Используется только для бэкапа конфигурации (см.
+        backup_server_settings()) — сам этот метод ничего не пишет на
+        сервер, только читает.
+
+        Авторизация — та же схема, что у get()/get_channels_info()
+        (query-параметр password=SDK-пароль), не login+sid из публичных
+        примеров TRASSIR — другая схема здесь никогда не проверялась
+        живьём, а эта уже подтверждённо работает для /health и /objects/
+        на этом же сервере с тем же паролем.
+
+        Требует отдельного флага SDK "Чтение настроек" на регистраторе
+        (отдельного от того, что нужен для /health и /objects/). Если он
+        не включён, сервер может ответить не 200 или не-JSON — в этом
+        случае возвращаем сырую причину в "error", а не глохнем молча,
+        чтобы в UI было видно ЧТО конкретно не так на конкретном сервере.
+        """
+        try:
+            params = {"password": self.sdk} if self.sdk else {}
+
+            response = self.session.get(
+                f"{self.url}/settings/",
+                params=params,
+                timeout=30
+            )
+
+            if response.status_code != 200:
+                return {
+                    "ok": 0,
+                    "error": f"HTTP {response.status_code}: {response.text[:300]!r}"
+                }
+
+            text = response.text
+            text = re.sub(r'//.*?\n', '\n', text)
+            text = re.sub(r'/\*.*?\*/', '', text, flags=re.DOTALL)
+
+            try:
+                data = json.loads(text)
+            except ValueError as e:
+                return {
+                    "ok": 0,
+                    "error": f"Сервер ответил не-JSON (не включена 'Чтение настроек' в SDK?): {e} — {text[:300]!r}"
+                }
+
+            return {"ok": 1, "data": data}
+
+        except requests.exceptions.Timeout:
+            return {"ok": 0, "error": "Таймаут соединения"}
+        except requests.exceptions.ConnectionError as e:
+            return {"ok": 0, "error": f"Ошибка соединения: {e}"}
         except Exception as e:
             return {"ok": 0, "error": str(e)}
 
@@ -1642,6 +1724,91 @@ def cleanup_old_data():
     except Exception as e:
         print(f"Ошибка очистки старых данных: {e}")
 
+
+def backup_server_settings():
+    """
+    Снимает дерево настроек (через SDK /settings/) с каждого активного
+    регистратора и сохраняет как JSON-файл, храня последние
+    CONFIG_BACKUP_KEEP версий на сервер (остальные удаляются — и файл,
+    и строка в config_backups).
+
+    Это НЕ родной бэкап TRASSIR Client'а (.settings-backup/.dump) — тот
+    через SDK недоступен (см. комментарий у таблицы config_backups и у
+    TrassirClient.get_settings()). Отказ по одному серверу (SDK-пароль
+    без прав "Чтение настроек", сервер недоступен и т.п.) не прерывает
+    бэкап остальных — ошибка просто записывается в его собственную
+    строку config_backups, видно в /settings какой конкретно сервер и
+    почему.
+    """
+    try:
+        conn = get_db()
+        servers = conn.execute("SELECT * FROM servers WHERE enabled = 1").fetchall()
+
+        os.makedirs(CONFIG_BACKUP_DIR, exist_ok=True)
+
+        for server in servers:
+            server_id = server["id"]
+            client = TrassirClient({
+                "ip": server["ip"],
+                "port": server["port"],
+                "ssl": bool(server["ssl"]),
+                "sdk_password": server["sdk_password"]
+            })
+
+            result = client.get_settings()
+            server_dir = os.path.join(CONFIG_BACKUP_DIR, str(server_id))
+
+            if result["ok"]:
+                os.makedirs(server_dir, exist_ok=True)
+                # Микросекунды, не только секунды — два бэкапа подряд
+                # (двойной клик "Снять бэкап сейчас", быстрый повторный
+                # запуск) иначе получают одинаковое имя файла и молча
+                # перезатирают друг друга на диске; с одинаковым именем
+                # у двух РАЗНЫХ строк config_backups ротация старых версий
+                # удаляет файл, на который ещё ссылается новая строка.
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+                file_path = os.path.join(server_dir, f"settings_{ts}.json")
+                payload = json.dumps(result["data"], ensure_ascii=False, indent=2)
+                with open(file_path, "w", encoding="utf-8") as f:
+                    f.write(payload)
+
+                conn.execute(
+                    "INSERT INTO config_backups (server_id, ok, file_path, size_bytes, error) "
+                    "VALUES (?, 1, ?, ?, '')",
+                    (server_id, file_path, len(payload.encode("utf-8")))
+                )
+                print(f"  {server['name']}: бэкап настроек сохранён ({len(payload)} байт)")
+            else:
+                conn.execute(
+                    "INSERT INTO config_backups (server_id, ok, file_path, size_bytes, error) "
+                    "VALUES (?, 0, '', 0, ?)",
+                    (server_id, result["error"])
+                )
+                print(f"  {server['name']}: бэкап настроек НЕ снят — {result['error']}")
+
+            # Храним только последние CONFIG_BACKUP_KEEP строк (успешных
+            # и неуспешных вместе — иначе цепочка ошибок никогда не
+            # ротируется и забивает таблицу бесполезными строками).
+            old_rows = conn.execute(
+                "SELECT id, file_path FROM config_backups WHERE server_id = ? "
+                "ORDER BY ts DESC, id DESC LIMIT -1 OFFSET ?",
+                (server_id, CONFIG_BACKUP_KEEP)
+            ).fetchall()
+            for row in old_rows:
+                if row["file_path"]:
+                    try:
+                        os.remove(row["file_path"])
+                    except OSError:
+                        pass
+                conn.execute("DELETE FROM config_backups WHERE id = ?", (row["id"],))
+
+            conn.commit()
+
+        conn.close()
+    except Exception as e:
+        print(f"Ошибка бэкапа настроек регистраторов: {e}")
+
+
 # ============================================
 # ПЛАНИРОВЩИК
 # ============================================
@@ -1662,6 +1829,7 @@ def scheduler():
     # Настраиваем периодический запуск
     schedule.every(interval).seconds.do(collect)
     schedule.every(1).hours.do(cleanup_old_data)
+    schedule.every().day.at("03:30").do(backup_server_settings)
 
     # Первый сбор через 5 секунд после старта
     time.sleep(5)
@@ -1940,7 +2108,8 @@ def settings_page():
         tg_chats=tg_chats,
         tg_settings=tg_settings,
         mail_recipients=mail_recipients,
-        mail_settings=mail_settings
+        mail_settings=mail_settings,
+        config_backup_keep=CONFIG_BACKUP_KEEP
     )
 
 # ============================================
@@ -2255,6 +2424,78 @@ def import_servers():
         threading.Thread(target=collect).start()
 
     return jsonify({"ok": 1, "added": added, "updated": updated, "errors": errors})
+
+
+@app.route("/api/config-backup/run", methods=["POST"])
+def run_config_backup():
+    """
+    Запускает снятие бэкапа настроек всех активных регистраторов прямо
+    сейчас (вместо ожидания ночного расписания из scheduler()). Запускается
+    в фоновом потоке — запрос возвращается сразу, реальный результат по
+    каждому серверу виден через /api/config-backup/status после того, как
+    поток завершится.
+    """
+    if not session.get("logged_in"):
+        return jsonify({"ok": 0, "error": "Требуется авторизация"}), 403
+
+    threading.Thread(target=backup_server_settings).start()
+    return jsonify({"ok": 1, "message": "Бэкап запущен в фоне"})
+
+
+@app.route("/api/config-backup/status")
+def config_backup_status():
+    """
+    Текущее состояние бэкапов настроек по каждому серверу: последний
+    результат (успех/ошибка) + список последних CONFIG_BACKUP_KEEP версий.
+    """
+    if not session.get("logged_in"):
+        return jsonify({"ok": 0, "error": "Требуется авторизация"}), 403
+
+    conn = get_db()
+    servers = conn.execute("SELECT id, name FROM servers ORDER BY name").fetchall()
+
+    result = []
+    for server in servers:
+        backups = conn.execute(
+            "SELECT id, ts, ok, size_bytes, error FROM config_backups "
+            "WHERE server_id = ? ORDER BY ts DESC, id DESC LIMIT ?",
+            (server["id"], CONFIG_BACKUP_KEEP)
+        ).fetchall()
+        result.append({
+            "server_id": server["id"],
+            "server_name": server["name"],
+            "backups": [dict(b) for b in backups]
+        })
+    conn.close()
+
+    return jsonify({"ok": 1, "servers": result})
+
+
+@app.route("/api/config-backup/download/<int:backup_id>")
+def download_config_backup(backup_id):
+    """
+    Скачивает один конкретный файл бэкапа настроек по id строки
+    config_backups. file_path проверяется на существование — запись в
+    БД может пережить ротацию/удаление самого файла при редком гонке
+    между скачиванием и следующим backup_server_settings().
+    """
+    if not session.get("logged_in"):
+        return jsonify({"ok": 0, "error": "Требуется авторизация"}), 403
+
+    conn = get_db()
+    row = conn.execute(
+        "SELECT cb.file_path, cb.ts, s.name FROM config_backups cb "
+        "JOIN servers s ON s.id = cb.server_id WHERE cb.id = ? AND cb.ok = 1",
+        (backup_id,)
+    ).fetchone()
+    conn.close()
+
+    if not row or not row["file_path"] or not os.path.isfile(row["file_path"]):
+        return jsonify({"ok": 0, "error": "Файл бэкапа не найден"}), 404
+
+    safe_name = re.sub(r'[^\w.-]', '_', row["name"])
+    download_name = f"{safe_name}_settings_{row['ts'].replace(' ', '_').replace(':', '')}.json"
+    return send_file(row["file_path"], as_attachment=True, download_name=download_name)
 
 
 @app.route("/api/ack/<int:server_id>", methods=["POST"])
@@ -4426,6 +4667,29 @@ cat > $INSTALL_DIR/templates/settings.html << 'SETTINGSEOF'
                 <div id="importResult" class="mt-2"></div>
             </div>
         </div>
+
+        <!-- Бэкап настроек регистраторов через SDK -->
+        <div class="card mt-4">
+            <div class="card-header">
+                <i class="bi bi-hdd-stack"></i> Бэкап настроек регистраторов (SDK)
+            </div>
+            <div class="card-body">
+                <p style="font-size:0.85rem; color:var(--muted);">
+                    Каждую ночь в 03:30 монитор сам снимает дерево настроек
+                    (сеть, камеры, архив и т.д.) с каждого активного регистратора
+                    через SDK-пароль и хранит последние {{ config_backup_keep }}
+                    версий на сервер. Это не тот же файл, что «Сохранить бэкап»
+                    в самом TRASSIR Client (<code>.settings-backup</code>/<code>.dump</code>) —
+                    тот создаётся кнопкой в клиенте и SDK его не видит, это
+                    отдельный JSON-снимок для просмотра/диагностики.
+                </p>
+                <button class="btn btn-outline-primary btn-sm mb-3" onclick="runConfigBackupNow()">
+                    <i class="bi bi-play-fill"></i> Снять бэкап сейчас
+                </button>
+                <div id="configBackupResult" class="mb-2"></div>
+                <div id="configBackupList">Загрузка...</div>
+            </div>
+        </div>
         {% endif %}
     </div>
 </div>
@@ -4672,6 +4936,64 @@ async function importServers() {
         resultDiv.innerHTML = '<div class="alert alert-danger py-2 mb-0">' + escapeHtml(result.error || 'Ошибка импорта') + '</div>';
     }
 }
+
+function renderConfigBackups(data) {
+    var listDiv = document.getElementById('configBackupList');
+    if (!data.servers || !data.servers.length) {
+        listDiv.innerHTML = '<p class="text-muted mb-0">Нет добавленных серверов</p>';
+        return;
+    }
+    var html = '<table class="table table-sm"><thead><tr><th>Сервер</th><th>Последний бэкап</th><th>Версии</th></tr></thead><tbody>';
+    data.servers.forEach(function(srv) {
+        var last = srv.backups.length ? srv.backups[0] : null;
+        var lastCell;
+        if (!last) {
+            lastCell = '<span class="text-muted">ещё не снимался</span>';
+        } else if (last.ok) {
+            lastCell = '<span style="color:var(--green);">✅ ' + escapeHtml(last.ts) + '</span>';
+        } else {
+            lastCell = '<span style="color:var(--red);" title="' + escapeHtml(last.error) + '">❌ ' + escapeHtml(last.ts) + '</span>';
+        }
+        var versions = srv.backups.filter(function(b) { return b.ok; }).map(function(b) {
+            return '<a href="/api/config-backup/download/' + b.id + '" class="btn btn-outline-secondary btn-sm me-1 mb-1">' +
+                   escapeHtml(b.ts) + ' (' + Math.round(b.size_bytes / 1024) + ' КБ)</a>';
+        }).join('');
+        html += '<tr><td>' + escapeHtml(srv.server_name) + '</td><td>' + lastCell + '</td><td>' +
+                (versions || '<span class="text-muted">—</span>') + '</td></tr>';
+    });
+    html += '</tbody></table>';
+    listDiv.innerHTML = html;
+}
+
+async function loadConfigBackupStatus() {
+    try {
+        var r = await fetch('/api/config-backup/status');
+        var data = await r.json();
+        if (r.ok) renderConfigBackups(data);
+        else document.getElementById('configBackupList').innerHTML = '<p class="text-danger mb-0">Ошибка загрузки статуса</p>';
+    } catch (e) {
+        document.getElementById('configBackupList').innerHTML = '<p class="text-danger mb-0">Ошибка загрузки статуса</p>';
+    }
+}
+
+async function runConfigBackupNow() {
+    var resultDiv = document.getElementById('configBackupResult');
+    resultDiv.innerHTML = '<div class="alert alert-info py-2 mb-0">Запущено, обновление через несколько секунд...</div>';
+    var r = await fetch('/api/config-backup/run', { method: 'POST' });
+    var result = await r.json();
+    if (!r.ok) {
+        resultDiv.innerHTML = '<div class="alert alert-danger py-2 mb-0">' + escapeHtml(result.error || 'Ошибка запуска') + '</div>';
+        return;
+    }
+    setTimeout(function() {
+        resultDiv.innerHTML = '';
+        loadConfigBackupStatus();
+    }, 8000);
+}
+
+{% if logged_in %}
+loadConfigBackupStatus();
+{% endif %}
 
 async function testConnection() {
     var data = Object.fromEntries(new FormData(document.getElementById('addForm')));

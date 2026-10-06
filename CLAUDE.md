@@ -1935,6 +1935,123 @@ both halves of this bug needed independent proof, since the earlier
 Telegram fix only had to prove the bash-side resolution, never a
 DB-write-mode bug underneath it.
 
+## Nightly config-backup of TRASSIR registrators via SDK `/settings/` (2026-10-06)
+
+Direct request: TRASSIR runs in a closed network with no internet access
+(so TRASSIR Cloud's own "Automatic server settings backup" is a non-
+starter), and the user wants a local, self-hosted equivalent — snapshot
+each registrator's config every night, keep the last `CONFIG_BACKUP_KEEP`
+(5) versions. Researched before writing any code (this engagement's
+standing rule — never invent TRASSIR SDK syntax without confirming it
+against real, documented behavior first):
+
+- TRASSIR Client's own "Сохранить бэкап" button (Local server settings
+  window) produces `_t1server.settings` (config) and a `*.dump` (DB) —
+  but that's a **client-side action over the management port** (3080 in
+  the user's own screenshot), not an SDK/HTTP call. No documented way to
+  trigger or download those exact files through the SDK (port 8080) —
+  didn't guess at the protocol on 3080, consistent with this project's
+  "don't invent what isn't confirmed" principle applied elsewhere
+  (`custom_domain_cli.sh`-style caution in sibling repos' CLAUDE.md).
+- The SDK **does** have a real, documented `/settings/` endpoint — GET
+  returns the server's entire settings tree (network/cameras/archive/
+  etc.) as JSON, same tree write-accessible via `/settings/path=value`.
+  Confirmed via the user's own screenshot of their real server's SDK
+  config page: the `Script` user already has **"Чтение настроек"**
+  (Read settings) checked — the one extra permission this needs beyond
+  what `/health`/`/objects/` already use.
+- These are explicitly **not the same artifact** — `/settings/`'s JSON
+  tree is a diagnostic/backup-of-values snapshot, not TRASSIR's own
+  native binary/text backup format, and can't be fed back through
+  TRASSIR Client's "Восстановить бэкап". Documented this distinction
+  in both the DB schema comment (`config_backups` table) and the
+  `/settings` page UI card itself, so nobody mistakes one for the other
+  later.
+
+**Implementation** (`install-trassir-monitor.sh`, `app.py`'s heredoc):
+- `TrassirClient.get_settings()` — same auth scheme as `get()`/
+  `get_channels_info()` (query-param `password=`, not the login+sid flow
+  from TRASSIR's public examples, which has never been tested against
+  this project's servers) hitting `/settings/`. Returns the raw error
+  (HTTP code + truncated body, or "not JSON" with a hint about the
+  missing permission) on any failure instead of swallowing it — this
+  project has hit the "swallowed subprocess/response detail behind a
+  bare bool" bug shape enough times elsewhere (see several entries
+  above) to default to surfacing it from the start here.
+- `backup_server_settings()` — loops `servers WHERE enabled = 1`, writes
+  each successful snapshot to `data/config_backups/<server_id>/
+  settings_<timestamp>.json`, records a `config_backups` row (ok/error/
+  size) either way, then prunes to the last `CONFIG_BACKUP_KEEP` rows
+  per server (deletes both the DB row and its file for anything older).
+  One server's failure (bad SDK password, permission not enabled,
+  unreachable) never blocks the others — each gets its own row showing
+  exactly why, visible per-server in the UI instead of one opaque
+  all-or-nothing result.
+- Scheduled via `scheduler()`: `schedule.every().day.at("03:30").do(
+  backup_server_settings)` — alongside the existing hourly
+  `cleanup_old_data()`. Deliberately **not** also run once at startup
+  (unlike `collect()`/`cleanup_old_data()`) — `/settings/` is a heavier,
+  less-proven-in-production call than `/health`/`/objects/`, no reason
+  to hit every registrar's SDK on every dashboard restart/"Update all"
+  on top of the nightly schedule. A manual "Снять бэкап сейчас" button
+  (`POST /api/config-backup/run`, runs in a background thread, login-
+  gated) covers the "test it right now" need instead.
+- `GET /api/config-backup/status` (login-gated) / `GET /api/config-backup/
+  download/<id>` (login-gated, validates the file still exists on disk —
+  a DB row can outlive its file across a rare race with the next
+  `backup_server_settings()` run) / UI card on `/settings` (status per
+  server + download links for each kept version) — same login-gating
+  principle as the existing servers export (`/api/servers/export`):
+  reads that could matter to security or just clutter an anonymous view
+  are gated same as writes.
+- **Deliberately read-only — no restore/write-back implemented.** The
+  SDK's `/settings/path=value` write form exists and is documented, but
+  "Запись настроек" (Write settings) is off on the user's own `Script`
+  SDK user, and turning it on plus writing an entire tree back to a live
+  production registrator is a materially bigger risk (a wrong branch of
+  the tree, a type mismatch, a value TRASSIR doesn't actually accept
+  the way the tree implies) than this pass should take on. Backup first,
+  restore is a separate, harder, explicitly-not-yet-built feature if
+  ever needed.
+
+**Real bug caught by the test harness, not by review**: the backup
+filename used second-resolution timestamps
+(`strftime("%Y%m%d_%H%M%S")`). Two backups firing within the same
+second (a double-click on "Снять бэкап сейчас", or — how this was
+actually caught — a test loop running `backup_server_settings()` faster
+than 1/sec) get the *same* filename, silently overwriting each other on
+disk while `config_backups` still inserts a separate row per call, each
+pointing at that one shared path. The pruning step then deletes that
+shared file the moment the *older* of the two rows ages out — even
+though a newer, still-kept row's `file_path` points at the exact same
+(now-deleted) file. Fixed by switching to `strftime("%Y%m%d_%H%M%S_%f")`
+(microsecond resolution) — reproduced with a 7-iteration rapid-fire test
+loop before the fix (0 files survived on disk despite 5 "successful" DB
+rows) and confirmed fixed after (exactly 5 files present, matching the 5
+kept rows).
+
+Verified end-to-end, same mock-based method this whole engagement uses
+(no live TRASSIR server access from any session): extracted `app.py`
+from its heredoc, patched `BASE_DIR` to a temp dir, replaced
+`TrassirClient` with a scripted fake (one server always succeeds, one
+always 403s, one disabled server never gets polled at all) and ran
+`backup_server_settings()` seven times against a real temp SQLite DB —
+confirmed correct pruning to exactly `CONFIG_BACKUP_KEEP` rows *and*
+files for both the always-succeeding and always-failing server, correct
+per-row error text, and file content/size matching what was written.
+Separately verified `TrassirClient.get_settings()` directly against
+mocked HTTP responses (success with JS-comment-stripped JSON — same
+defensive parsing `get()` already does for `/health` — 403, a 200 that
+isn't JSON at all, timeout, connection error, and the empty-password
+case). All three Flask routes verified via `test_client()`: reject
+anonymous access, status reflects zero-then-one backup correctly after
+a real run through the background-thread code path, download serves the
+real file with a correct attachment header, and a nonexistent backup id
+returns a clean 404 instead of a crash. The new `renderConfigBackups()`
+JS was verified with `node --check` plus a mocked-DOM functional run
+covering XSS-escaping of a hostile server name, correct ✅/❌ rendering,
+and correct per-version download-link generation.
+
 ## Publishing hygiene
 
 Public repo. Never commit real server hostnames/IPs, ISP/provider names,
