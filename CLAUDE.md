@@ -1858,7 +1858,82 @@ behavior at all.
 same unconditional-re-prompt shape for SMTP host/port/login/password/
 recipients — flagged in the "Item 5" note above as the next place to
 apply this same fix, deliberately not done here to keep this change
-scoped to what was actually reported.
+scoped to what was actually reported. **Done in the immediate direct
+follow-up — see the next dated entry.**
+
+## Same fix applied to install-mail-notifier.sh — plus a worse variant of the same bug (2026-10-06)
+
+Direct follow-up, same session: "на Email делай тоже самое". Same
+`IS_UPDATE` principle, detected by querying `mail_settings` for an
+existing non-empty `smtp_server` (there's no `config.ini` for mail at
+all — every SMTP setting lives in the `mail_settings` key/value DB
+table, so "already configured" has to be read from the DB via a small
+`_read_mail_setting(key)` helper — `$VENV_PYTHON -c "..."` with the key
+name passed as `sys.argv[1]`, not string-interpolated into the Python
+source, so the helper stays safe to call with any key name even though
+in practice it's only ever called with this file's own hardcoded
+literals). `CHECK_INTERVAL` has the identical "baked into the bot's
+`.py` via `sed`, never in a settings table" shape already found for
+Telegram — same fix, `grep -oP '^CHECK_INTERVAL = \K[0-9]+' "$MAILBOT_PY"`
+against the file still on disk before this run's heredoc overwrites it.
+
+**Investigating this surfaced a worse variant of the exact bug the
+Telegram fix addressed, not just the same shape.** Telegram's risk was
+a *blank* answer silently wiping an already-set value (because
+`config.ini` gets unconditionally rewritten in full every run). Mail's
+settings write was `INSERT OR IGNORE INTO mail_settings` for every
+key, including the ones this very script prompts for — meaning a
+*real, deliberately typed new value* (rotating a compromised SMTP
+password, switching providers) was the one that got silently
+discarded, because the row for that key already existed from the first
+install and `OR IGNORE` never touches an existing row. The script would
+print "✅ Настройки сохранены", "Всё верно?" would show the NEW values
+the person just typed, and the actual row in the database would still
+hold the ORIGINAL ones — arguably more dangerous than Telegram's
+blank-wipe case, since there the UI at least implied nothing happened;
+here every visible signal said the change took effect.
+
+**Fix**: split the `defaults` dict into two. `prompted_settings`
+(`smtp_server`/`smtp_port`/`smtp_user`/`smtp_pass`/`from_name`/
+`from_addr`/`monitor_url` — every key this script's own prompts cover,
+and which the bash side above already resolved to "old value if Enter,
+new value if typed" before this Python block ever runs) now goes
+through `INSERT OR REPLACE`, so whatever the bash side resolved
+actually lands in the database regardless of which path produced it.
+`defaults_only` (`enabled`, `notify_interval` — keys this installer
+has no prompt for at all, toggled independently through `/settings`)
+stays on the original `INSERT OR IGNORE` **deliberately** — switching
+those to `REPLACE` too would have silently re-enabled Email
+notifications on every reinstall for anyone who'd turned them off
+through the web UI, trading one silent-discard bug for a silent-reset
+one. Verified directly (not just through the prompt layer): simulated
+a user having disabled `enabled` via `/settings`, ran the
+`defaults_only` `INSERT OR IGNORE` block again exactly as the installer
+does on every run, confirmed `enabled` stayed `'0'` — while
+`prompted_settings`'s `INSERT OR REPLACE` with a new `smtp_server`/
+`smtp_pass` correctly overwrote the old row.
+
+**Password handling kept stricter than the token masking used for
+Telegram** — deliberately didn't show even a masked preview of the
+existing SMTP password (unlike the token, which does show
+`first10...last4`): the pre-existing confirmation screen already only
+ever said "задан" for the password, never any characters of it, and
+this fix preserves that, just phrasing the *prompt* itself as "Enter —
+оставить текущий, уже задан" instead of changing what gets displayed.
+
+Verified with the same method as the Telegram fix: the real prompt
+block `sed`-sliced out of the shipped file (not retyped) into an
+isolated harness with synthetic `mail_settings`/`mail_recipients`/
+`mail_bot.py` fixtures, piped keystrokes — all-blank update preserves
+every value including the interval read out of the old `mail_bot.py`;
+a new server + new password typed with everything else blank changes
+only those two; a genuinely fresh install still enforces required
+fields and fresh defaults. The actual `INSERT OR REPLACE`/`OR IGNORE`
+split was verified separately, directly against a real SQLite
+connection (not just that the bash variables resolved correctly) —
+both halves of this bug needed independent proof, since the earlier
+Telegram fix only had to prove the bash-side resolution, never a
+DB-write-mode bug underneath it.
 
 ## Publishing hygiene
 
