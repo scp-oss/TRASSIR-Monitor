@@ -633,12 +633,11 @@ works" principle as everything else added this engagement.
   (`force_fresh=1` — see `_get_script()` below) rather than whatever
   happens to be sitting next to the launcher. The dashboard update is
   fully safe and non-interactive thanks to the `IS_UPDATE` fix above.
-  Telegram/Email are a different story: their installers still
-  unconditionally re-prompt for bot token/chat IDs/SMTP credentials on
-  every run — no "keep current value" default exists there yet (a
-  real, scoped-out follow-up, not something silently overlooked; see
-  the confirmation text below the "Continue?" prompt for how this is
-  disclosed honestly rather than pretending the update is fully silent).
+  **Telegram's installer got the equivalent fix 2026-10-06** (see that
+  dated entry below for the full writeup) — Email's (`install-mail-
+  notifier.sh`) has NOT been touched yet and still unconditionally
+  re-prompts for SMTP credentials/recipients on every run, same
+  real-but-scoped-out gap this note used to describe for both.
 - **`_get_script(name, force_fresh)`** resolves a needed script two
   ways: prefer a same-name file sitting next to the launcher itself
   (`$SCRIPT_DIR`, works with zero network access for anyone who cloned
@@ -1783,6 +1782,83 @@ reason is (wrong path, wrong auth scheme, relay down, relay not
 actually forwarding to real Telegram) is now visible in the UI instead
 of a bare ❌, which is what's actually needed to diagnose a third-party
 relay this project has no visibility into otherwise.
+
+## Telegram installer unconditionally re-prompted for token/chats/proxy on every run, including "Update all" (fixed 2026-10-06)
+
+Live complaint, direct follow-up to the two entries above: a user asked
+why updating the dashboard through the launcher kept forcing them to
+re-enter Telegram settings (token, chat IDs, and — the one with real
+teeth — the proxy/relay config they'd just finished diagnosing).
+Confirmed by reading `install-telegram-notifier.sh`'s own prompt
+section: it had **no equivalent of `install-trassir-monitor.sh`'s own
+`IS_UPDATE` detection** at all — every `read -p` ran unconditionally on
+every single invocation, update or not. Already flagged as a known,
+deliberately-scoped-out gap in `launcher-trassir-monitor.sh`'s own
+"Item 5 (Update all)" note (see above) — but "scoped out" had been
+sitting there since this engagement's early sessions, and a live user
+actually hitting it now made it worth closing.
+
+**Not just friction — the proxy field was a real, silent data-loss
+risk.** `proxy = $TG_PROXY` in the `config.ini` heredoc overwrites
+unconditionally; since the field is optional, simply pressing Enter
+without remembering to retype an already-configured proxy/relay string
+would silently reset it to empty on every single "Update all" —
+exactly the kind of thing someone would only notice once notifications
+mysteriously stopped working again after an unrelated dashboard update.
+
+**Fix, same principle as `install-trassir-monitor.sh`'s own port/
+password handling**: `IS_UPDATE` detected by `[ -f "$CONFIG_FILE" ]`
+(the existing config file is the one reliable signal an install already
+happened — not a separate flag that could drift from reality, same
+reasoning used throughout this file). When true:
+- **Token**: shows the masked current value, Enter keeps it.
+- **Chat IDs**: counts existing rows in `telegram_chats` first (they
+  live in the DB, not `config.ini`, and were already safe from loss via
+  `INSERT OR IGNORE` — this was pure friction, not risk) — if any exist,
+  the prompt becomes "add more, Enter to skip" instead of a mandatory
+  field; the confirmation summary shows "уже есть: N, новых: M" instead
+  of implying the typed value is the complete list.
+- **Proxy**: shows the masked current value (same `sed` mask the
+  original confirmation screen already used), Enter keeps it, and a
+  literal `-` is the explicit way to actually clear it — needed because
+  otherwise there would be no way to intentionally remove a
+  previously-set proxy at all once "blank" stopped meaning "clear it".
+- **Check interval**: this one was never in `config.ini` at all — it's
+  baked directly into `tg_bot.py`'s source via `sed` at install time
+  (`CHECK_INTERVAL = 10` literal, replaced with the real value after the
+  heredoc writes the file fresh every run). The "current" value is only
+  recoverable by `grep`-ing it out of the **old** `tg_bot.py` still on
+  disk, before this run's heredoc overwrites it — done via
+  `grep -oP '^CHECK_INTERVAL = \K[0-9]+'`, the same `-oP`/`\K` idiom
+  `install-trassir-monitor.sh` already uses for its own port detection.
+- **Monitor URL**: same current-value-shown, Enter-keeps-it treatment,
+  reading the existing `monitor_url` line from `config.ini`.
+
+A fresh install (`IS_UPDATE=0`) is completely unchanged — same required
+prompts, same defaults, same confirmation screen shape as before this
+fix; the new behavior only activates when `config.ini` already exists.
+
+**Verified by extracting the real prompt block** (lines between the new
+"СВЕЖАЯ УСТАНОВКА ИЛИ ОБНОВЛЕНИЕ?" section and the confirmation screen,
+`sed`-sliced straight out of the actual shipped file, not a hand-retyped
+copy — same reasoning as `z2r_autobench`'s own standing lesson about not
+trusting a test that only exercises code through one accidental path)
+into an isolated harness with synthetic `config.ini`/`tg_bot.py`/DB
+fixtures, piping simulated keystrokes via `printf`: (1) five blank
+Enters on an update with an existing proxy/token/interval/URL/chats →
+every value preserved exactly, zero new chats forced; (2) `-` for proxy
+specifically → cleared to empty, everything else preserved; (3) a new
+token and a new interval typed, everything else blank → only those two
+actually changed; (4) a genuinely fresh install (no `config.ini`/
+`tg_bot.py` present at all) → required prompts still enforced, defaults
+still computed fresh, confirming the new logic doesn't change first-time
+behavior at all.
+
+**Not done in this pass**: `install-mail-notifier.sh` has the exact
+same unconditional-re-prompt shape for SMTP host/port/login/password/
+recipients — flagged in the "Item 5" note above as the next place to
+apply this same fix, deliberately not done here to keep this change
+scoped to what was actually reported.
 
 ## Publishing hygiene
 
