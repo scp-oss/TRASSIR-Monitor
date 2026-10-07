@@ -2618,6 +2618,59 @@ every tag still balances and both login-prompt cards remain present
 and in the right column in the anonymous render — not just eyeballing
 the logged-in screenshot that prompted this fix.
 
+## Telegram bot installer: one question on update instead of five (2026-10-07, v6.2)
+
+Direct complaint right after the config.ini-preservation fix above
+actually started working as intended: "но он все спрашивает при
+обновлении не логично" — on a routine "Update all", with `config.ini`
+correctly detected and every field showing "Enter — оставить
+текущий", the script still walked through 5 separate prompts (token,
+chats, proxy, interval, URL) just to press Enter five times and change
+nothing. `install-trassir-monitor.sh` (the main dashboard installer)
+already set the right precedent for this exact situation: on its own
+`IS_UPDATE=1`, it doesn't ask about the port or admin password AT
+ALL — it silently keeps them, only falling back to a prompt if it
+genuinely can't determine the old value. The Telegram installer only
+had the weaker, "Enter-per-field" version of that idea.
+
+**Fix**: one new question right after detecting `IS_UPDATE=1`, before
+any of the 5 original ones — "Изменить что-то из этого сейчас?
+(Enter — нет, оставить как есть / y — да)". Answering the default
+(Enter) sets `RECONFIGURE=0`, and every one of the 5 field-prompts
+below is now gated on `[ "$RECONFIGURE" -eq 1 ]`: when it's `0`, each
+one skips its `read -p` entirely and silently assigns the old value
+(`TG_TOKEN=$OLD_TOKEN`, etc. — same values the old per-field "Enter"
+flow would have landed on, just without 5 keystrokes to get there).
+Typing `y` instead falls through to the exact original interactive
+behavior, unchanged, field by field — this is purely about collapsing
+"do you want to change anything" from N implicit questions into one
+explicit one, not about removing the ability to actually reconfigure.
+Fresh installs (`IS_UPDATE=0`) are entirely unaffected — `RECONFIGURE`
+defaults to `1` and that whole gate is skipped.
+
+**Also fixed in the same pass, found from the user's own pasted run**:
+ШАГ 7 unconditionally sent the `"✅ TRASSIR Monitor — Бот установлен!"`
+test message to Telegram on every single run, update or not — on a
+routine update where nothing changed, this is confusing spam (reads
+like a fresh install happened) sent once per update, forever. Now
+gated the same way: only fires on a genuine fresh install
+(`IS_UPDATE=0`) or when the admin explicitly chose to reconfigure
+(`RECONFIGURE=1`) — a routine "update, nothing changed" run now just
+restarts the service and prints a one-line local confirmation instead
+of pinging every recipient's phone.
+
+Verified by extracting the real prompt-collection block (lines
+~90-350, not retyped) into a standalone script and running it three
+ways against a simulated `config.ini`/`tg_bot.py`/`trassir.db`: (1)
+a single empty `Enter` for the new top-level question → all 5 old
+values come through byte-for-byte with zero further prompts needed
+(confirmed via `timeout` not hanging waiting for more input); (2) `y`
++ all-Enter → identical end result to before this fix, same old
+values, just still asks per-field; (3) `y` + an actual new token
+typed → the new value correctly overrides the old one. A separate
+run against an empty (no existing config) directory confirmed the
+fresh-install path is byte-for-byte unaffected.
+
 ## Publishing hygiene
 
 Public repo. Never commit real server hostnames/IPs, ISP/provider names,
