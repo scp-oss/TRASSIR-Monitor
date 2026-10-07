@@ -2671,6 +2671,49 @@ typed → the new value correctly overrides the old one. A separate
 run against an empty (no existing config) directory confirmed the
 fresh-install path is byte-for-byte unaffected.
 
+## Event feed timestamps were 3 hours ahead of real time (found + fixed 2026-10-07, v13.5)
+
+Live complaint with a concrete example: a "Login Successful" event
+showed `12:57:58` while the user's real current time was `10:18` —
+roughly a 3-hour gap, not an off-by-one or rounding issue.
+
+**Cause, confirmed by reproducing it, not just theorized**: the SDK
+manual's own wording for `/events` is a hedge worth re-reading
+literally — "The response time is indicated in microseconds in
+UNIX-time format **according to time zone configured on the
+server**." A true UNIX timestamp has no timezone at all (it's an
+absolute instant) — this phrasing means TRASSIR computes the value
+from the server's LOCAL wall-clock reading without first converting
+to true UTC, i.e. the "epoch" it sends already bakes in whatever
+timezone the server itself is configured for (this project already
+assumes that's Moscow/+3 everywhere else — see every
+`datetime('now', '+3 hours')` in this file's own SQL). The old JS
+(`new Date(ms).toLocaleString('ru-RU')`, no `timeZone` option)
+treated that value as a genuine UTC instant and let the BROWSER's own
+(also Moscow) timezone add another +3 hours on top when rendering —
+the shift got applied twice, once by TRASSIR and once by the browser.
+Reproduced exactly with `TZ=Europe/Moscow node ...`: a timestamp whose
+raw microseconds correspond to `09:45:09` rendered as `12:45:09` under
+the old code — the identical shape of the user's live complaint.
+**Not yet independently confirmed that the TRASSIR server in question
+is actually configured for Europe/Moscow** — inferred from this
+project's own standing "+3 hours" convention everywhere else, not
+re-verified against this specific server's own settings; if a future
+report shows a different, non-3-hour gap, that's the first thing to
+check before assuming this same fix still applies unmodified.
+- **Fix**: added `{ timeZone: 'UTC' }` to the `toLocaleString()` call —
+  this does NOT mean "this is UTC", it means "don't apply any further
+  shift on top of the wall-clock numbers TRASSIR already sent" (`Intl`
+  interprets a `Date`'s internal UTC-labeled fields directly when
+  `timeZone: 'UTC'` is given, which is exactly the already-correct
+  wall-clock value here — UTC is just the zero-shift option, not an
+  assertion about what timezone the data is really in).
+- Verified by reproducing the exact bug under `TZ=Europe/Moscow` against
+  the real extracted `loadEvents()` (not retyped): before the fix, the
+  test's raw timestamp rendered as `12:45:09`; after, `09:45:09` — and
+  the committed test asserts the fixed code produces the latter, not
+  the former, so a future regression back to double-shifting fails loudly.
+
 ## Publishing hygiene
 
 Public repo. Never commit real server hostnames/IPs, ISP/provider names,

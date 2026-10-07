@@ -1,6 +1,6 @@
 #!/bin/bash
 # ============================================
-# TRASSIR Monitor v13.4
+# TRASSIR Monitor v13.5
 # Проверено на Debian 12 13
 # ============================================
 set -e
@@ -23,7 +23,7 @@ clear
 # Баннер
 echo -e "${GREEN}╔══════════════════════════════════════════════╗${NC}"
 echo -e "${GREEN}║                                              ║${NC}"
-echo -e "${GREEN}║   TRASSIR Monitor v13.4 — Final Complete     ║${NC}"
+echo -e "${GREEN}║   TRASSIR Monitor v13.5 — Final Complete     ║${NC}"
 echo -e "${GREEN}║   Имена каналов • Алерты • Live дашборд      ║${NC}"
 echo -e "${GREEN}║   Debian 12/13 • gevent • Python 3.12/3.13   ║${NC}"
 echo -e "${GREEN}║                                              ║${NC}"
@@ -508,7 +508,7 @@ echo ""
 cat > $INSTALL_DIR/app/app.py << 'APPEOF'
 #!/usr/bin/env python3
 """
-TRASSIR Monitor v13.4 — Основной файл приложения
+TRASSIR Monitor v13.5 — Основной файл приложения
 Полная версия с определением имён отключённых каналов
 
 Функции:
@@ -556,7 +556,7 @@ SECRET_KEY_PATH = os.path.join(BASE_DIR, "data", "secret_key.txt")
 # является настоящим бэкапом в текущем виде.
 APP_BACKUP_DIR = os.path.join(BASE_DIR, "data", "app_backups")
 APP_BACKUP_KEEP = 5
-APP_VERSION = "v13.4"
+APP_VERSION = "v13.5"
 
 # ============================================
 # ИНИЦИАЛИЗАЦИЯ FLASK
@@ -3246,7 +3246,7 @@ def api_services_status():
 if __name__ != "__main__":
     # Вывод при запуске через gunicorn
     print("=" * 60)
-    print("  TRASSIR Monitor v13.4")
+    print("  TRASSIR Monitor v13.5")
     print("  Система мониторинга серверов TRASSIR")
     print("=" * 60)
 
@@ -4942,8 +4942,24 @@ function loadEvents() {
                 var tsLabel = '';
                 if (ev.timestamp) {
                     // timestamp от TRASSIR — в микросекундах (см. SDK-мануал), для JS Date нужны миллисекунды.
+                    //
+                    // {timeZone:'UTC'} ниже — НЕ ошибка и не означает "в UTC".
+                    // Живой баг, подтверждён пользователем: TRASSIR отдаёт это
+                    // значение уже посчитанным по часовому поясу, настроенному
+                    // НА САМОМ СЕРВЕРЕ (та самая оговорка в SDK-мануале — "The
+                    // response time is indicated ... according to time zone
+                    // configured on the server"), а не как честный UTC-эпох.
+                    // Без {timeZone:'UTC'} браузер в московском часовом поясе
+                    // (тот же +3, что весь остальной проект уже закладывает —
+                    // см. datetime('now', '+3 hours') в SQL по всему файлу)
+                    // добавлял сверху ЕЩЁ +3 часа при рендере через
+                    // toLocaleString(), то есть сдвиг применялся дважды:
+                    // событие в реальные 09:45 показывалось как 12:45.
+                    // {timeZone:'UTC'} запрещает Intl второй раз сдвигать уже
+                    // готовые часы/минуты из значения — то есть просто выводит
+                    // ровно те цифры, что прислал TRASSIR, без интерпретации.
                     var ms = parseInt(ev.timestamp, 10) / 1000;
-                    if (!isNaN(ms)) { tsLabel = new Date(ms).toLocaleString('ru-RU'); }
+                    if (!isNaN(ms)) { tsLabel = new Date(ms).toLocaleString('ru-RU', { timeZone: 'UTC' }); }
                 }
                 var translated = translateEventType(ev);
                 var extra = [];
@@ -6066,7 +6082,7 @@ echo ""
 # Gunicorn конфигурация
 echo "  • Создание конфигурации Gunicorn..."
 cat > $INSTALL_DIR/gunicorn_config.py << GUNEOF
-# Конфигурация Gunicorn для TRASSIR Monitor v13.4
+# Конфигурация Gunicorn для TRASSIR Monitor v13.5
 # Использует gevent для поддержки WebSocket (совместим с Python 3.12+/3.13)
 
 bind = "127.0.0.1:${APP_PORT}"
@@ -6085,7 +6101,7 @@ echo "    ✓ gunicorn_config.py создан"
 echo "  • Создание systemd сервиса..."
 cat > /etc/systemd/system/$SERVICE.service << SERVEOF
 [Unit]
-Description=TRASSIR Monitor v13.4
+Description=TRASSIR Monitor v13.5
 Documentation=https://github.com/trassir-monitor
 After=network-online.target
 Wants=network-online.target
@@ -6126,7 +6142,7 @@ echo "    ✓ nginx drop-in создан"
 # Nginx конфигурация
 echo "  • Создание конфигурации Nginx..."
 cat > /etc/nginx/sites-available/trassir-monitor << NGINXEOF
-# Nginx конфигурация для TRASSIR Monitor v13.4
+# Nginx конфигурация для TRASSIR Monitor v13.5
 server {
     listen $WEB_PORT default_server;
     listen [::]:$WEB_PORT default_server;
@@ -6567,9 +6583,9 @@ echo ""
 echo -e "${GREEN}╔══════════════════════════════════════════════╗${NC}"
 echo -e "${GREEN}║                                              ║${NC}"
 if [ "$IS_UPDATE" -eq 1 ]; then
-echo -e "${GREEN}║   TRASSIR Monitor v13.4 — ОБНОВЛЁН!          ║${NC}"
+echo -e "${GREEN}║   TRASSIR Monitor v13.5 — ОБНОВЛЁН!          ║${NC}"
 else
-echo -e "${GREEN}║   TRASSIR Monitor v13.4 — УСТАНОВЛЕН!        ║${NC}"
+echo -e "${GREEN}║   TRASSIR Monitor v13.5 — УСТАНОВЛЕН!        ║${NC}"
 fi
 echo -e "${GREEN}║                                              ║${NC}"
 echo -e "${GREEN}╚══════════════════════════════════════════════╝${NC}"
