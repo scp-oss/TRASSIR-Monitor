@@ -2525,6 +2525,54 @@ same overall workflow, destroys the precondition it depends on. When
 a "we already fixed this" bug reappears, check what ELSE runs in the
 same update sequence before concluding the original fix regressed.
 
+## Event feed translated to Russian (2026-10-07)
+
+Direct follow-up to the live event feed added the same day: raw
+TRASSIR event types came through in English, and the real server's
+own feed (pasted live by the user) showed a vendor quirk worth noting
+— `"Login Successful, %1 from %2"` is sent **literally, with
+unsubstituted `%1`/`%2`** — the actual username/IP live in separate
+`username`/`ip_address` fields on the same event object. Confirmed
+this is the vendor's own documented behavior, not a bug on our side:
+the official SDK manual's own example response for `/events` shows
+the identical unsubstituted template string.
+
+`EVENT_TRANSLATIONS` (new, in `server.html`'s scripts block) maps each
+CONFIRMED event type to Russian — confirmed meaning either documented
+in the official manual's "Request for server events" example/
+properties table (`Motion Start`/`Motion Stop`/`Smoke Detected`/
+`Smoke Stopped`/`Object Size Alarm`/`No Connection to Cloud`/the two
+`%1`/`%2` template types) or seen live on a real server and pasted
+into this conversation (`Signal Lost`/`Signal Restored`/
+`Connection Lost`/`Connection Established`/`Health Turns Bad`/
+`Health Turns Good` — none of these five are in the manual's text at
+all, grep-confirmed, but they're real). Deliberately did **not**
+invent translations for event types neither source confirms — same
+"don't guess, verify" discipline as everywhere else in this file (see
+the `save_configuration`/`cloudbackup_*` research entry above). An
+unrecognized type falls back to showing the raw English string
+as-is — a plain, honest fallback beats a plausible-sounding but wrong
+invented translation.
+
+The two `%1`/`%2` types get a `render(ev)` function instead of a
+static string — substitutes the real fields into a Russian sentence
+(`"Вход выполнен: Admin с 172.30.0.103"`) and marks `skipExtra: true`
+so the feed's normal username/IP metadata line isn't duplicated
+underneath (it's already in the sentence). Substituted values still
+go through `escHtml()` — tested with a malicious `username` containing
+`<script>` to confirm the template path can't reopen the XSS surface
+the feed was already hardened against.
+
+Tested the same way as the feed's own original XSS test: extracted the
+real `translateEventType()`/`loadEvents()` out of the heredoc (not
+retyped) and ran them under `jsdom` — every known type's exact Russian
+text, both `%1`/`%2` substitutions (including a missing-field case
+falling back to `"?"` instead of literal `"undefined"`), the malicious-
+username-stays-escaped case, an unknown type's safe fallback, and a
+full end-to-end `loadEvents()` render confirming zero raw `%1`/`%2`
+ever reaches the page. 23/23 pass, plus the original 8-test XSS suite
+still passes unchanged.
+
 ## Publishing hygiene
 
 Public repo. Never commit real server hostnames/IPs, ISP/provider names,

@@ -1,6 +1,6 @@
 #!/bin/bash
 # ============================================
-# TRASSIR Monitor v13.2
+# TRASSIR Monitor v13.3
 # Проверено на Debian 12 13
 # ============================================
 set -e
@@ -23,7 +23,7 @@ clear
 # Баннер
 echo -e "${GREEN}╔══════════════════════════════════════════════╗${NC}"
 echo -e "${GREEN}║                                              ║${NC}"
-echo -e "${GREEN}║   TRASSIR Monitor v13.2 — Final Complete     ║${NC}"
+echo -e "${GREEN}║   TRASSIR Monitor v13.3 — Final Complete     ║${NC}"
 echo -e "${GREEN}║   Имена каналов • Алерты • Live дашборд      ║${NC}"
 echo -e "${GREEN}║   Debian 12/13 • gevent • Python 3.12/3.13   ║${NC}"
 echo -e "${GREEN}║                                              ║${NC}"
@@ -508,7 +508,7 @@ echo ""
 cat > $INSTALL_DIR/app/app.py << 'APPEOF'
 #!/usr/bin/env python3
 """
-TRASSIR Monitor v13.2 — Основной файл приложения
+TRASSIR Monitor v13.3 — Основной файл приложения
 Полная версия с определением имён отключённых каналов
 
 Функции:
@@ -556,7 +556,7 @@ SECRET_KEY_PATH = os.path.join(BASE_DIR, "data", "secret_key.txt")
 # является настоящим бэкапом в текущем виде.
 APP_BACKUP_DIR = os.path.join(BASE_DIR, "data", "app_backups")
 APP_BACKUP_KEEP = 5
-APP_VERSION = "v13.2"
+APP_VERSION = "v13.3"
 
 # ============================================
 # ИНИЦИАЛИЗАЦИЯ FLASK
@@ -3246,7 +3246,7 @@ def api_services_status():
 if __name__ != "__main__":
     # Вывод при запуске через gunicorn
     print("=" * 60)
-    print("  TRASSIR Monitor v13.2")
+    print("  TRASSIR Monitor v13.3")
     print("  Система мониторинга серверов TRASSIR")
     print("=" * 60)
 
@@ -4878,6 +4878,53 @@ function toggleEvents() {
     }
 }
 
+// Перевод типов событий TRASSIR — только те, что реально подтверждены
+// (официальный SDK-мануал + живые события с реального сервера), никаких
+// придуманных вариантов на типы, которых мы не видели. Неизвестный тип
+// просто показывается как есть (английским) — лучше нейтральный фоллбэк,
+// чем выдуманный неверный перевод.
+//
+// Два типа ("Login Successful, %1 from %2", "Connected To %1 under %2")
+// TRASSIR отдаёт буквально с НЕподставленными %1/%2 — реальные значения
+// лежат в отдельных полях события (username/ip_address или
+// server_address/under_username), подстановка их в текст — это SDK-
+// особенность, не наша ошибка (проверено по официальному мануалу,
+// пример ответа там точно такой же).
+var EVENT_TRANSLATIONS = {
+    'Motion Start':          { text: 'Обнаружено движение' },
+    'Motion Stop':           { text: 'Движение прекратилось' },
+    'Signal Lost':           { text: 'Пропал сигнал' },
+    'Signal Restored':       { text: 'Сигнал восстановлен' },
+    'Connection Lost':       { text: 'Потеряно соединение' },
+    'Connection Established':{ text: 'Соединение установлено' },
+    'Health Turns Bad':      { text: 'Состояние здоровья ухудшилось' },
+    'Health Turns Good':     { text: 'Состояние здоровья нормализовалось' },
+    'Smoke Detected':        { text: 'Обнаружен дым' },
+    'Smoke Stopped':         { text: 'Дым больше не обнаруживается' },
+    'Object Size Alarm':     { text: 'Тревога: превышен размер объекта' },
+    'No Connection to Cloud':{ text: 'Нет соединения с облаком TRASSIR' },
+    'Login Successful, %1 from %2': {
+        render: function(ev) {
+            return 'Вход выполнен: ' + escHtml(ev.username || '?') + ' с ' + escHtml(ev.ip_address || '?');
+        },
+        skipExtra: true
+    },
+    'Connected To %1 under %2': {
+        render: function(ev) {
+            return 'Подключение к серверу ' + escHtml(ev.server_address || '?') + ' от имени ' + escHtml(ev.under_username || '?');
+        },
+        skipExtra: true
+    }
+};
+
+function translateEventType(ev) {
+    var raw = ev.type || 'Событие';
+    var entry = EVENT_TRANSLATIONS[raw];
+    if (!entry) { return { html: escHtml(raw), skipExtra: false }; }
+    if (entry.render) { return { html: entry.render(ev), skipExtra: !!entry.skipExtra }; }
+    return { html: escHtml(entry.text), skipExtra: false };
+}
+
 function loadEvents() {
     var feed = document.getElementById('eventsFeed');
     fetch('/api/events/{{ server.id }}')
@@ -4898,12 +4945,18 @@ function loadEvents() {
                     var ms = parseInt(ev.timestamp, 10) / 1000;
                     if (!isNaN(ms)) { tsLabel = new Date(ms).toLocaleString('ru-RU'); }
                 }
+                var translated = translateEventType(ev);
                 var extra = [];
-                if (ev.username) { extra.push(escHtml(ev.username)); }
-                if (ev.ip_address) { extra.push(escHtml(ev.ip_address)); }
+                // username/ip_address уже вшиты в переведённый текст для
+                // типов с skipExtra (Login Successful) — не дублируем их
+                // отдельной строкой под датой.
+                if (!translated.skipExtra) {
+                    if (ev.username) { extra.push(escHtml(ev.username)); }
+                    if (ev.ip_address) { extra.push(escHtml(ev.ip_address)); }
+                }
                 var extraStr = extra.length ? ' · ' + extra.join(' · ') : '';
                 return '<div style="padding:6px 0; border-bottom:1px solid rgba(255,255,255,0.05);">' +
-                    '<div>' + escHtml(ev.type || 'Событие') + '</div>' +
+                    '<div>' + translated.html + '</div>' +
                     '<small style="color:var(--muted);">' + escHtml(tsLabel) + extraStr + '</small>' +
                     '</div>';
             }).join('');
@@ -6004,7 +6057,7 @@ echo ""
 # Gunicorn конфигурация
 echo "  • Создание конфигурации Gunicorn..."
 cat > $INSTALL_DIR/gunicorn_config.py << GUNEOF
-# Конфигурация Gunicorn для TRASSIR Monitor v13.2
+# Конфигурация Gunicorn для TRASSIR Monitor v13.3
 # Использует gevent для поддержки WebSocket (совместим с Python 3.12+/3.13)
 
 bind = "127.0.0.1:${APP_PORT}"
@@ -6023,7 +6076,7 @@ echo "    ✓ gunicorn_config.py создан"
 echo "  • Создание systemd сервиса..."
 cat > /etc/systemd/system/$SERVICE.service << SERVEOF
 [Unit]
-Description=TRASSIR Monitor v13.2
+Description=TRASSIR Monitor v13.3
 Documentation=https://github.com/trassir-monitor
 After=network-online.target
 Wants=network-online.target
@@ -6064,7 +6117,7 @@ echo "    ✓ nginx drop-in создан"
 # Nginx конфигурация
 echo "  • Создание конфигурации Nginx..."
 cat > /etc/nginx/sites-available/trassir-monitor << NGINXEOF
-# Nginx конфигурация для TRASSIR Monitor v13.2
+# Nginx конфигурация для TRASSIR Monitor v13.3
 server {
     listen $WEB_PORT default_server;
     listen [::]:$WEB_PORT default_server;
@@ -6505,9 +6558,9 @@ echo ""
 echo -e "${GREEN}╔══════════════════════════════════════════════╗${NC}"
 echo -e "${GREEN}║                                              ║${NC}"
 if [ "$IS_UPDATE" -eq 1 ]; then
-echo -e "${GREEN}║   TRASSIR Monitor v13.2 — ОБНОВЛЁН!          ║${NC}"
+echo -e "${GREEN}║   TRASSIR Monitor v13.3 — ОБНОВЛЁН!          ║${NC}"
 else
-echo -e "${GREEN}║   TRASSIR Monitor v13.2 — УСТАНОВЛЕН!        ║${NC}"
+echo -e "${GREEN}║   TRASSIR Monitor v13.3 — УСТАНОВЛЕН!        ║${NC}"
 fi
 echo -e "${GREEN}║                                              ║${NC}"
 echo -e "${GREEN}╚══════════════════════════════════════════════╝${NC}"
