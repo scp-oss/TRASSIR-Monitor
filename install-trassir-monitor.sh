@@ -1,6 +1,6 @@
 #!/bin/bash
 # ============================================
-# TRASSIR Monitor v13.3
+# TRASSIR Monitor v13.4
 # Проверено на Debian 12 13
 # ============================================
 set -e
@@ -23,7 +23,7 @@ clear
 # Баннер
 echo -e "${GREEN}╔══════════════════════════════════════════════╗${NC}"
 echo -e "${GREEN}║                                              ║${NC}"
-echo -e "${GREEN}║   TRASSIR Monitor v13.3 — Final Complete     ║${NC}"
+echo -e "${GREEN}║   TRASSIR Monitor v13.4 — Final Complete     ║${NC}"
 echo -e "${GREEN}║   Имена каналов • Алерты • Live дашборд      ║${NC}"
 echo -e "${GREEN}║   Debian 12/13 • gevent • Python 3.12/3.13   ║${NC}"
 echo -e "${GREEN}║                                              ║${NC}"
@@ -508,7 +508,7 @@ echo ""
 cat > $INSTALL_DIR/app/app.py << 'APPEOF'
 #!/usr/bin/env python3
 """
-TRASSIR Monitor v13.3 — Основной файл приложения
+TRASSIR Monitor v13.4 — Основной файл приложения
 Полная версия с определением имён отключённых каналов
 
 Функции:
@@ -556,7 +556,7 @@ SECRET_KEY_PATH = os.path.join(BASE_DIR, "data", "secret_key.txt")
 # является настоящим бэкапом в текущем виде.
 APP_BACKUP_DIR = os.path.join(BASE_DIR, "data", "app_backups")
 APP_BACKUP_KEEP = 5
-APP_VERSION = "v13.3"
+APP_VERSION = "v13.4"
 
 # ============================================
 # ИНИЦИАЛИЗАЦИЯ FLASK
@@ -3246,7 +3246,7 @@ def api_services_status():
 if __name__ != "__main__":
     # Вывод при запуске через gunicorn
     print("=" * 60)
-    print("  TRASSIR Monitor v13.3")
+    print("  TRASSIR Monitor v13.4")
     print("  Система мониторинга серверов TRASSIR")
     print("=" * 60)
 
@@ -5022,8 +5022,8 @@ cat > $INSTALL_DIR/templates/settings.html << 'SETTINGSEOF'
 
 <div class="row g-4">
     <!-- Параметры мониторинга -->
-    {% if logged_in %}
     <div class="col-lg-6">
+    {% if logged_in %}
         <div class="card">
             <div class="card-header">
                 <i class="bi bi-sliders"></i> Параметры мониторинга
@@ -5095,8 +5095,36 @@ cat > $INSTALL_DIR/templates/settings.html << 'SETTINGSEOF'
                 </form>
             </div>
         </div>
-    </div>
     {% endif %}
+
+        <!-- Telegram секция — показывается если служба установлена.
+             Раньше жила в отдельном <div class="row g-4"> ниже модальных
+             окон вместе с Email — из-за этого она появлялась не сразу
+             под "Сменой пароля" в этой же колонке, а только после того,
+             как ПРАВАЯ колонка (Список серверов + Экспорт/импорт + Бэкап,
+             она длиннее) полностью заканчивалась: Bootstrap-строка не
+             начинает следующую строку, пока не закроется текущая с обеих
+             колонок. Перенесена прямо в эту колонку, чтобы идти сразу за
+             картой пароля, без ожидания соседней колонки. -->
+        <div id="telegramSection" class="mt-4" style="display:none;">
+            <div class="card">
+                <div class="card-header">
+                    <span><i class="bi bi-telegram"></i> Telegram уведомления</span>
+                </div>
+                <div class="card-body" id="telegramBody">
+                    {% if not logged_in %}
+                    <div class="text-center py-3">
+                        <i class="bi bi-lock" style="color:var(--muted);font-size:2rem;"></i>
+                        <p class="mt-2" style="color:var(--muted);">Войдите для управления Telegram</p>
+                        <a href="/login" class="btn btn-primary btn-sm">Войти</a>
+                    </div>
+                    {% else %}
+                    <p style="color:var(--muted);">Загрузка...</p>
+                    {% endif %}
+                </div>
+            </div>
+        </div>
+    </div>
 
     <!-- Список серверов -->
     <div class="col-lg-6">
@@ -5204,6 +5232,30 @@ cat > $INSTALL_DIR/templates/settings.html << 'SETTINGSEOF'
             </div>
         </div>
         {% endif %}
+
+        <!-- Mail секция — показывается если служба установлена.
+             Перенесена в эту колонку по той же причине, что и Telegram
+             выше (см. комментарий там) — раньше ждала конца соседней
+             строки вместо того, чтобы идти сразу за "Бэкап настроек
+             монитора". -->
+        <div id="mailSection" class="mt-4" style="display:none;">
+            <div class="card">
+                <div class="card-header">
+                    <span><i class="bi bi-envelope"></i> Email уведомления</span>
+                </div>
+                <div class="card-body" id="mailBody">
+                    {% if not logged_in %}
+                    <div class="text-center py-3">
+                        <i class="bi bi-lock" style="color:var(--muted);font-size:2rem;"></i>
+                        <p class="mt-2" style="color:var(--muted);">Войдите для управления Email</p>
+                        <a href="/login" class="btn btn-primary btn-sm">Войти</a>
+                    </div>
+                    {% else %}
+                    <p style="color:var(--muted);">Загрузка...</p>
+                    {% endif %}
+                </div>
+            </div>
+        </div>
     </div>
 </div>
 
@@ -5294,49 +5346,6 @@ cat > $INSTALL_DIR/templates/settings.html << 'SETTINGSEOF'
     </div>
 </div>
 {% endif %}
-
-<!-- Telegram и Mail секции -->
-<div class="row g-4 mt-0">
-<!-- Telegram секция — показывается если служба установлена -->
-<div class="col-lg-6" id="telegramSection" style="display:none;">
-    <div class="card">
-        <div class="card-header">
-            <span><i class="bi bi-telegram"></i> Telegram уведомления</span>
-        </div>
-        <div class="card-body" id="telegramBody">
-            {% if not logged_in %}
-            <div class="text-center py-3">
-                <i class="bi bi-lock" style="color:var(--muted);font-size:2rem;"></i>
-                <p class="mt-2" style="color:var(--muted);">Войдите для управления Telegram</p>
-                <a href="/login" class="btn btn-primary btn-sm">Войти</a>
-            </div>
-            {% else %}
-            <p style="color:var(--muted);">Загрузка...</p>
-            {% endif %}
-        </div>
-    </div>
-</div>
-
-<!-- Mail секция — показывается если служба установлена -->
-<div class="col-lg-6" id="mailSection" style="display:none;">
-    <div class="card">
-        <div class="card-header">
-            <span><i class="bi bi-envelope"></i> Email уведомления</span>
-        </div>
-        <div class="card-body" id="mailBody">
-            {% if not logged_in %}
-            <div class="text-center py-3">
-                <i class="bi bi-lock" style="color:var(--muted);font-size:2rem;"></i>
-                <p class="mt-2" style="color:var(--muted);">Войдите для управления Email</p>
-                <a href="/login" class="btn btn-primary btn-sm">Войти</a>
-            </div>
-            {% else %}
-            <p style="color:var(--muted);">Загрузка...</p>
-            {% endif %}
-        </div>
-    </div>
-</div>
-</div>
 
 {% endblock %}
 
@@ -6057,7 +6066,7 @@ echo ""
 # Gunicorn конфигурация
 echo "  • Создание конфигурации Gunicorn..."
 cat > $INSTALL_DIR/gunicorn_config.py << GUNEOF
-# Конфигурация Gunicorn для TRASSIR Monitor v13.3
+# Конфигурация Gunicorn для TRASSIR Monitor v13.4
 # Использует gevent для поддержки WebSocket (совместим с Python 3.12+/3.13)
 
 bind = "127.0.0.1:${APP_PORT}"
@@ -6076,7 +6085,7 @@ echo "    ✓ gunicorn_config.py создан"
 echo "  • Создание systemd сервиса..."
 cat > /etc/systemd/system/$SERVICE.service << SERVEOF
 [Unit]
-Description=TRASSIR Monitor v13.3
+Description=TRASSIR Monitor v13.4
 Documentation=https://github.com/trassir-monitor
 After=network-online.target
 Wants=network-online.target
@@ -6117,7 +6126,7 @@ echo "    ✓ nginx drop-in создан"
 # Nginx конфигурация
 echo "  • Создание конфигурации Nginx..."
 cat > /etc/nginx/sites-available/trassir-monitor << NGINXEOF
-# Nginx конфигурация для TRASSIR Monitor v13.3
+# Nginx конфигурация для TRASSIR Monitor v13.4
 server {
     listen $WEB_PORT default_server;
     listen [::]:$WEB_PORT default_server;
@@ -6558,9 +6567,9 @@ echo ""
 echo -e "${GREEN}╔══════════════════════════════════════════════╗${NC}"
 echo -e "${GREEN}║                                              ║${NC}"
 if [ "$IS_UPDATE" -eq 1 ]; then
-echo -e "${GREEN}║   TRASSIR Monitor v13.3 — ОБНОВЛЁН!          ║${NC}"
+echo -e "${GREEN}║   TRASSIR Monitor v13.4 — ОБНОВЛЁН!          ║${NC}"
 else
-echo -e "${GREEN}║   TRASSIR Monitor v13.3 — УСТАНОВЛЕН!        ║${NC}"
+echo -e "${GREEN}║   TRASSIR Monitor v13.4 — УСТАНОВЛЕН!        ║${NC}"
 fi
 echo -e "${GREEN}║                                              ║${NC}"
 echo -e "${GREEN}╚══════════════════════════════════════════════╝${NC}"

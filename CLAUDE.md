@@ -2573,6 +2573,51 @@ full end-to-end `loadEvents()` render confirming zero raw `%1`/`%2`
 ever reaches the page. 23/23 pass, plus the original 8-test XSS suite
 still passes unchanged.
 
+## `/settings` layout: Telegram/Email cards moved into the two-column flow (2026-10-07)
+
+Reported live with a screenshot: "Telegram уведомления" appeared far
+below "Смена пароля администратора" with a big empty gap, instead of
+right underneath it, even though both sit in the visually-left column.
+
+**Cause**: Bootstrap's `.row`/`.col-*` grid is flexbox-based, not true
+masonry — a new `<div class="row g-4">` only starts rendering once
+BOTH columns of the previous row have finished, regardless of which
+column is taller. The page had `/settings`'s content in two separate
+rows: row 1 = "Параметры мониторинга"+"Смена пароля" (left column) next
+to "Список серверов"+"Экспорт/импорт"+"Бэкап настроек монитора" (right
+column, three stacked cards, taller); row 2 = "Telegram уведомления"
+next to "Email уведомления". Row 2 couldn't start until row 1's
+TALLER right column finished — so "Telegram" waited for "Бэкап
+настроек монитора" to finish, landing visually far below "Смена
+пароля" even though it's in the same (left) column.
+
+**Fix**: moved both `#telegramSection` and `#mailSection` physically
+into the SAME column containers as row 1 — Telegram right after
+"Смена пароля" in the left `col-lg-6`, Email right after "Бэкап
+настроек монитора" in the right `col-lg-6` — instead of being separate
+sibling columns in a trailing row. Both lost their own `col-lg-6`
+class (no longer direct grid children, just stacked `mt-4` divs inside
+an existing column, same idiom the other stacked cards already use)
+and kept everything else identical (`id`, `style="display:none"`,
+inner `{% if not logged_in %}`/`{% else %}` content) — the JS that
+toggles their visibility (`document.getElementById('telegramSection')
+.style.display = 'block'`, etc.) only ever looked them up by id, never
+assumed DOM position, so none of that needed to change.
+
+The outer `{% if logged_in %}` that used to wrap the ENTIRE left
+column (including its own opening/closing `<div class="col-lg-6">`)
+had to be narrowed to wrap only "Параметры мониторинга"/"Смена
+пароля" — otherwise nesting Telegram inside it would have hidden the
+Telegram card (and its own anonymous "Войдите для управления
+Telegram" prompt) completely for anonymous visitors, a real regression
+that would've been easy to miss since this project's dev/test loop
+never exercises the logged-out view by default. Caught by rendering
+the real template through Jinja2 for `logged_in=True` AND
+`logged_in=False` and parsing the result with `html.parser` to confirm
+every tag still balances and both login-prompt cards remain present
+and in the right column in the anonymous render — not just eyeballing
+the logged-in screenshot that prompted this fix.
+
 ## Publishing hygiene
 
 Public repo. Never commit real server hostnames/IPs, ISP/provider names,
