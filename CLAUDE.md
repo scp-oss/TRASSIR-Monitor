@@ -2335,6 +2335,75 @@ message, and a multi-package call (`gevent gevent-websocket`) is
 confirmed to reach `pip` as separate argv entries, not one mangled
 string.
 
+## Removed the SDK registrator-settings backup entirely (2026-10-07)
+
+The nightly SDK `/settings/`-tree backup of TRASSIR registrators
+(`CONFIG_BACKUP_*`, `TrassirClient.get_settings()`,
+`backup_server_settings()`, the three `/api/config-backup/*` routes,
+the "Бэкап настроек регистраторов (SDK)" card and its JS) was removed
+entirely — kept in this file's history above for context, but no
+longer shipped. Two independent, now-confirmed reasons:
+
+1. **It never actually backed up real settings.** A live downloaded
+   file showed only `{"subdirs": [...], "values": [...]}` — folder and
+   field *names*, no actual values. Confirmed from the official SDK
+   manual (`sdk_en.pdf`, the real TRASSIR SDK documentation — fetched
+   from the user's own Google Drive copy since every `trassir.com`/
+   `dssl.ru` domain is blocked by this project's own network egress
+   policy): bare `GET /settings/` only ever returns one level of
+   folder/field *names*; getting an actual value requires a full,
+   specific path per value
+   (`/settings/ip_cameras/<guid>/channel00_video_bitrate`). A real
+   backup would need one HTTP round-trip per leaf setting — hundreds
+   per registrator — which was never worth building for a feature that
+   was additive to begin with, not the user's actual stated priority.
+2. **The user's actual priority was narrower from the start**: "по
+   сути нам нужно бекапить только Список серверов Telegram уведомления
+   и Email уведомления" — exactly what `backup_app_settings()` (added
+   the same session, kept) already covers. Removing the SDK-tree
+   feature also fixed a real, reported cosmetic side effect: the two
+   columns on `/settings` had become visibly unbalanced in height after
+   this card was added, purely because it made the right column taller
+   than the left with nothing to match it.
+
+**Also chased down, for the record, two related claims that turned out
+unconfirmed/false** (both from a pasted AI-search answer, not from this
+session's own research) — worth remembering the pattern, not just the
+specific verdicts, next time a similarly-confident-sounding but
+unverified answer shows up:
+- `trassir.objects["Server"].save_configuration(path)` (claimed as an
+  internal "Автоматизация" Python-automation method that triggers a
+  real local settings backup) — searched the **full text** of the
+  official 142-page SDK manual: zero matches for `save_configuration`
+  or the claimed `.tsec` extension anywhere. Separately cross-checked
+  against `aatrubilin/trassir_script_framework` (a real, actively-used
+  open-source framework for TRASSIR automation scripts, GitHub) — its
+  test mocks cover dozens of genuine object methods in detail
+  (`export_archive`, `screenshot_v2`, PTZ, SIP calls, `archive_export`
+  variants on `OperatorGUI`) but have no `Server` object at all, let
+  alone a save/backup method — a real signal, not conclusive proof,
+  but consistent with the method not existing. The pasted answer's own
+  example `curl` commands were also independently disqualifying either
+  way: literally malformed URLs (`https://192.168.1` — not even a
+  complete IP address, no port, no path) that could never have been
+  copy-pasted from a real working session.
+- A genuinely real, confirmed-from-the-official-manual finding that
+  still doesn't help this project: `cloudbackup_upload_now`/
+  `cloudbackup_download_now`/`cloudbackup_automatic`/
+  `cloudbackup_last_made` are real, documented, read/write SDK settings
+  (under the server's `cloud` settings subfolder) that do exactly what
+  their names say — but they drive TRASSIR's own **Cloud** backup
+  specifically, requiring outbound internet to TRASSIR's cloud
+  service. This project's whole premise is a closed network with no
+  internet access, so this real mechanism is a confirmed dead end here
+  specifically, not a maybe.
+
+No schema migration needed for existing installs that already have the
+stray `config_backups` table/rows/files sitting on disk from the
+earlier version — harmless, unreferenced by any code from this point
+forward, deliberately left alone rather than adding cleanup machinery
+for an empty-ish table.
+
 ## Publishing hygiene
 
 Public repo. Never commit real server hostnames/IPs, ISP/provider names,
