@@ -1,6 +1,6 @@
 #!/bin/bash
 # ============================================
-# TRASSIR Monitor v13.1
+# TRASSIR Monitor v13.2
 # Проверено на Debian 12 13
 # ============================================
 set -e
@@ -23,7 +23,7 @@ clear
 # Баннер
 echo -e "${GREEN}╔══════════════════════════════════════════════╗${NC}"
 echo -e "${GREEN}║                                              ║${NC}"
-echo -e "${GREEN}║   TRASSIR Monitor v13.1 — Final Complete     ║${NC}"
+echo -e "${GREEN}║   TRASSIR Monitor v13.2 — Final Complete     ║${NC}"
 echo -e "${GREEN}║   Имена каналов • Алерты • Live дашборд      ║${NC}"
 echo -e "${GREEN}║   Debian 12/13 • gevent • Python 3.12/3.13   ║${NC}"
 echo -e "${GREEN}║                                              ║${NC}"
@@ -230,14 +230,33 @@ fi
 # этой сохранёнки ШАГ 5 остался бы без единого рабочего пакета после
 # `rm -rf $INSTALL_DIR`, потому что качать их заново было бы неоткуда.
 DATA_PRESERVE_DIR=""
-if [ "$IS_UPDATE" -eq 1 ] && [ -d "$INSTALL_DIR/data" ]; then
-    echo "  • Сохранение базы данных и статических файлов перед обновлением..."
+if [ "$IS_UPDATE" -eq 1 ]; then
     DATA_PRESERVE_DIR=$(mktemp -d)
-    cp -a "$INSTALL_DIR/data" "$DATA_PRESERVE_DIR/data"
-    if [ -d "$INSTALL_DIR/static" ]; then
-        cp -a "$INSTALL_DIR/static" "$DATA_PRESERVE_DIR/static"
+    if [ -d "$INSTALL_DIR/data" ]; then
+        echo "  • Сохранение базы данных и статических файлов перед обновлением..."
+        cp -a "$INSTALL_DIR/data" "$DATA_PRESERVE_DIR/data"
+        if [ -d "$INSTALL_DIR/static" ]; then
+            cp -a "$INSTALL_DIR/static" "$DATA_PRESERVE_DIR/static"
+        fi
+        echo "    ✓ data/ и static/ сохранены во временный каталог"
     fi
-    echo "    ✓ data/ и static/ сохранены во временный каталог"
+    # config.ini/config_tgproxy.ini — настройки Telegram-бота (токен,
+    # прокси, monitor_url), живут прямо в $INSTALL_DIR, а не в data/.
+    # Живой баг, подтверждён на реальном сервере: до этой правки
+    # `rm -rf $INSTALL_DIR` ниже уничтожал их при КАЖДОМ обновлении
+    # самого дашборда (install-trassir-monitor.sh), хотя сам
+    # install-telegram-notifier.sh умеет сохранять токен между СВОИМИ
+    # обновлениями через IS_UPDATE/[ -f "$CONFIG_FILE" ] (см. его же
+    # комментарий "СВЕЖАЯ УСТАНОВКА ИЛИ ОБНОВЛЕНИЕ?") — он просто
+    # ничего не мог сохранить, потому что файл к его запуску уже не
+    # существовал. Снаружи выглядело так, будто уже исправленный баг
+    # вернулся — реальная причина была в соседнем скрипте, не в нём.
+    for cfg in config.ini config_tgproxy.ini; do
+        if [ -f "$INSTALL_DIR/$cfg" ]; then
+            cp -a "$INSTALL_DIR/$cfg" "$DATA_PRESERVE_DIR/$cfg"
+            echo "    ✓ $cfg сохранён (настройки Telegram-бота)"
+        fi
+    done
 fi
 
 # Удаляем старый каталог
@@ -341,6 +360,15 @@ if [ -n "$DATA_PRESERVE_DIR" ] && [ -d "$DATA_PRESERVE_DIR/static" ]; then
     rm -rf "$INSTALL_DIR/static"
     cp -a "$DATA_PRESERVE_DIR/static" "$INSTALL_DIR/static"
     echo "    ✓ static/ восстановлен ($(du -sh "$INSTALL_DIR/static" 2>/dev/null | cut -f1))"
+fi
+# config.ini/config_tgproxy.ini — см. комментарий у их сохранения в ШАГе 1.
+if [ -n "$DATA_PRESERVE_DIR" ]; then
+    for cfg in config.ini config_tgproxy.ini; do
+        if [ -f "$DATA_PRESERVE_DIR/$cfg" ]; then
+            cp -a "$DATA_PRESERVE_DIR/$cfg" "$INSTALL_DIR/$cfg"
+            echo "    ✓ $cfg восстановлен (настройки Telegram-бота)"
+        fi
+    done
 fi
 rm -rf "$DATA_PRESERVE_DIR" 2>/dev/null || true
 
@@ -480,7 +508,7 @@ echo ""
 cat > $INSTALL_DIR/app/app.py << 'APPEOF'
 #!/usr/bin/env python3
 """
-TRASSIR Monitor v13.1 — Основной файл приложения
+TRASSIR Monitor v13.2 — Основной файл приложения
 Полная версия с определением имён отключённых каналов
 
 Функции:
@@ -528,7 +556,7 @@ SECRET_KEY_PATH = os.path.join(BASE_DIR, "data", "secret_key.txt")
 # является настоящим бэкапом в текущем виде.
 APP_BACKUP_DIR = os.path.join(BASE_DIR, "data", "app_backups")
 APP_BACKUP_KEEP = 5
-APP_VERSION = "v13.1"
+APP_VERSION = "v13.2"
 
 # ============================================
 # ИНИЦИАЛИЗАЦИЯ FLASK
@@ -3218,7 +3246,7 @@ def api_services_status():
 if __name__ != "__main__":
     # Вывод при запуске через gunicorn
     print("=" * 60)
-    print("  TRASSIR Monitor v13.1")
+    print("  TRASSIR Monitor v13.2")
     print("  Система мониторинга серверов TRASSIR")
     print("=" * 60)
 
@@ -5976,7 +6004,7 @@ echo ""
 # Gunicorn конфигурация
 echo "  • Создание конфигурации Gunicorn..."
 cat > $INSTALL_DIR/gunicorn_config.py << GUNEOF
-# Конфигурация Gunicorn для TRASSIR Monitor v13.1
+# Конфигурация Gunicorn для TRASSIR Monitor v13.2
 # Использует gevent для поддержки WebSocket (совместим с Python 3.12+/3.13)
 
 bind = "127.0.0.1:${APP_PORT}"
@@ -5995,7 +6023,7 @@ echo "    ✓ gunicorn_config.py создан"
 echo "  • Создание systemd сервиса..."
 cat > /etc/systemd/system/$SERVICE.service << SERVEOF
 [Unit]
-Description=TRASSIR Monitor v13.1
+Description=TRASSIR Monitor v13.2
 Documentation=https://github.com/trassir-monitor
 After=network-online.target
 Wants=network-online.target
@@ -6036,7 +6064,7 @@ echo "    ✓ nginx drop-in создан"
 # Nginx конфигурация
 echo "  • Создание конфигурации Nginx..."
 cat > /etc/nginx/sites-available/trassir-monitor << NGINXEOF
-# Nginx конфигурация для TRASSIR Monitor v13.1
+# Nginx конфигурация для TRASSIR Monitor v13.2
 server {
     listen $WEB_PORT default_server;
     listen [::]:$WEB_PORT default_server;
@@ -6477,9 +6505,9 @@ echo ""
 echo -e "${GREEN}╔══════════════════════════════════════════════╗${NC}"
 echo -e "${GREEN}║                                              ║${NC}"
 if [ "$IS_UPDATE" -eq 1 ]; then
-echo -e "${GREEN}║   TRASSIR Monitor v13.1 — ОБНОВЛЁН!          ║${NC}"
+echo -e "${GREEN}║   TRASSIR Monitor v13.2 — ОБНОВЛЁН!          ║${NC}"
 else
-echo -e "${GREEN}║   TRASSIR Monitor v13.1 — УСТАНОВЛЕН!        ║${NC}"
+echo -e "${GREEN}║   TRASSIR Monitor v13.2 — УСТАНОВЛЕН!        ║${NC}"
 fi
 echo -e "${GREEN}║                                              ║${NC}"
 echo -e "${GREEN}╚══════════════════════════════════════════════╝${NC}"

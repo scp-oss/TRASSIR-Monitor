@@ -2474,6 +2474,57 @@ already uses — no session/`sid=` flow needed.
   timeouts, a 200 response with a non-image content-type, a malformed
   non-list `/events` body, and the limit/ordering behavior) — all pass.
 
+## Dashboard updates were silently wiping the Telegram bot's config.ini (found + fixed 2026-10-07)
+
+Live incident, reported live mid-update: user ran an update and the
+Telegram bot installer asked to configure the token/proxy/monitor_url
+from scratch again — no "Enter — оставить текущий" option — even
+though the exact "preserve on update" fix for that prompt already
+exists and is correct in `install-telegram-notifier.sh` (see its own
+"СВЕЖАЯ УСТАНОВКА ИЛИ ОБНОВЛЕНИЕ?" comment). The regression wasn't in
+that script at all — it was one directory over.
+
+**Root cause**: `install-trassir-monitor.sh`'s own update path (ШАГ 1,
+"ОЧИСТКА СТАРОЙ УСТАНОВКИ") explicitly preserves `data/` (the DB) and
+`static/` (CDN assets) into a temp dir before `rm -rf $INSTALL_DIR`,
+then restores both in ШАГ 3 — a deliberate fix from earlier in this
+engagement for exactly this class of bug (see the preceding "СВЕЖАЯ
+УСТАНОВКА ИЛИ ОБНОВЛЕНИЕ?" comment at the top of the file). But
+`config.ini` (and the legacy `config_tgproxy.ini`) live directly in
+`$INSTALL_DIR`, not inside `data/` — they were never added to that
+preserve/restore list. So **every update of the main dashboard
+silently destroyed the Telegram bot's settings**, even though the bot
+itself was never touched and its own systemd service kept running the
+whole time on its already-loaded config. The Telegram installer's own
+`IS_UPDATE` check (`[ -f "$CONFIG_FILE" ]`) then correctly reported
+"no existing config" on its next run — because by that point there
+genuinely wasn't one — and asked for everything fresh. From the
+outside this looked exactly like the earlier config-preservation fix
+had regressed; it hadn't, the file it was checking for had already
+been deleted by a completely different script.
+
+**Fix**: `install-trassir-monitor.sh`'s ШАГ 1 now also copies
+`config.ini`/`config_tgproxy.ini` (whichever exist) into the same
+`DATA_PRESERVE_DIR` as `data/`/`static/`, and ШАГ 3 restores them the
+same way, right after `static/`. The outer preserve-block condition
+was loosened from `[ "$IS_UPDATE" -eq 1 ] && [ -d "$INSTALL_DIR/data" ]`
+to just `[ "$IS_UPDATE" -eq 1 ]` so a config file can still be saved
+even in the edge case where `data/` itself is missing. Verified by
+extracting the real preserve+restore block out of the script (not
+retyped) and running it standalone against a simulated `$INSTALL_DIR`
+containing both config files plus `data/`/`static/` — the token value
+in `config.ini` came out byte-for-byte identical on the other side of
+a full preserve → `rm -rf` → recreate → restore cycle.
+
+**Lesson, same shape as several other entries in this file** (the
+Zenith sandbox base-path saga, `sandbox_apply.py`'s swallowed stderr,
+`autoupdate.sh`'s dubious-ownership git calls): a fix that's correct
+and already shipped in the file you're looking at can still fail in
+production because a DIFFERENT script, in a different step of the
+same overall workflow, destroys the precondition it depends on. When
+a "we already fixed this" bug reappears, check what ELSE runs in the
+same update sequence before concluding the original fix regressed.
+
 ## Publishing hygiene
 
 Public repo. Never commit real server hostnames/IPs, ISP/provider names,
