@@ -1,6 +1,6 @@
 #!/bin/bash
 # ============================================
-# TRASSIR Monitor v13.5
+# TRASSIR Monitor v13.6
 # Проверено на Debian 12 13
 # ============================================
 set -e
@@ -23,7 +23,7 @@ clear
 # Баннер
 echo -e "${GREEN}╔══════════════════════════════════════════════╗${NC}"
 echo -e "${GREEN}║                                              ║${NC}"
-echo -e "${GREEN}║   TRASSIR Monitor v13.5 — Final Complete     ║${NC}"
+echo -e "${GREEN}║   TRASSIR Monitor v13.6 — Final Complete     ║${NC}"
 echo -e "${GREEN}║   Имена каналов • Алерты • Live дашборд      ║${NC}"
 echo -e "${GREEN}║   Debian 12/13 • gevent • Python 3.12/3.13   ║${NC}"
 echo -e "${GREEN}║                                              ║${NC}"
@@ -508,7 +508,7 @@ echo ""
 cat > $INSTALL_DIR/app/app.py << 'APPEOF'
 #!/usr/bin/env python3
 """
-TRASSIR Monitor v13.5 — Основной файл приложения
+TRASSIR Monitor v13.6 — Основной файл приложения
 Полная версия с определением имён отключённых каналов
 
 Функции:
@@ -556,7 +556,15 @@ SECRET_KEY_PATH = os.path.join(BASE_DIR, "data", "secret_key.txt")
 # является настоящим бэкапом в текущем виде.
 APP_BACKUP_DIR = os.path.join(BASE_DIR, "data", "app_backups")
 APP_BACKUP_KEEP = 5
-APP_VERSION = "v13.5"
+APP_VERSION = "v13.6"
+
+# Срок хранения локального архива входов в TRASSIR (login_events, см.
+# collect_login_events() ниже) — прямой запрос пользователя: "до 2 недель
+# или 1 недели". Отдельная константа, не настройка "Хранение данных"
+# (retention_days, управляет health/alerts) — это аудит-данные другой
+# природы, может иметь свой срок независимо от того, на что настроены
+# графики метрик.
+LOGIN_EVENTS_RETENTION_DAYS = 14
 
 # ============================================
 # ИНИЦИАЛИЗАЦИЯ FLASK
@@ -974,7 +982,43 @@ def init_db():
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_mail_logs_key ON mail_logs(alert_key, ts)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_health_srv_time ON health(server_id, ts)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_alerts_srv ON alerts(server_id, ack)")
-    
+
+    # ============================================
+    # Таблица login_events — локальный архив входов в TRASSIR
+    # ============================================
+    # Лента событий на странице сервера (см. /api/events/<id>) читает
+    # /events СЕЙЧАС, вживую, с самого TRASSIR — ничего не сохраняет.
+    # Прямой запрос пользователя: TRASSIR хранит свой буфер событий сам,
+    # размер/срок жизни которого нигде не документирован (см. комментарий
+    # у TrassirClient.get_events() выше) — если никто не держал страницу
+    # открытой, когда буфер провернулся, вход теряется безвозвратно.
+    # Это отдельная таблица, не привязанная к health/alerts — никогда не
+    # участвует в их логике (авто-закрытие и т.п.), только append-only
+    # запись + периодическая чистка по сроку (см. collect_login_events()
+    # и cleanup_old_data() ниже).
+    # UNIQUE(server_id, raw_timestamp) — /events у TRASSIR не поддерживает
+    # курсор "только новое с прошлого опроса" (см. мануал), каждый опрос
+    # отдаёт целый буфер заново, поэтому один и тот же вход будет
+    # встречаться в НЕСКОЛЬКИХ последовательных опросах подряд.
+    # raw_timestamp (сырое микросекундное значение от TRASSIR) — надёжный
+    # естественный ключ для дедупликации, в отличие от (username,
+    # ip_address) — у одного пользователя может быть несколько реальных
+    # входов подряд с одного и того же IP.
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS login_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            server_id INTEGER NOT NULL,
+            raw_timestamp TEXT NOT NULL,
+            event_time DATETIME,
+            username TEXT,
+            ip_address TEXT,
+            collected_at DATETIME DEFAULT (datetime('now', '+3 hours')),
+            FOREIGN KEY (server_id) REFERENCES servers (id),
+            UNIQUE (server_id, raw_timestamp)
+        )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_login_events_srv_time ON login_events(server_id, event_time)")
+
     # ============================================
     # Настройки по умолчанию
     # ============================================
@@ -1791,9 +1835,88 @@ def cleanup_old_data():
             """)
             conn.commit()
             print(f"Очистка старых данных: удалены записи старше {days} дн.")
+
+        # login_events — свой, отдельный от retention_days срок хранения
+        # (см. LOGIN_EVENTS_RETENTION_DAYS выше), не завязан на условие
+        # "days > 0" настройки "Хранение данных".
+        login_cutoff = f"-{LOGIN_EVENTS_RETENTION_DAYS} days"
+        conn.execute("DELETE FROM login_events WHERE event_time < datetime('now', '+3 hours', ?)", (login_cutoff,))
+        conn.commit()
+
         conn.close()
     except Exception as e:
         print(f"Ошибка очистки старых данных: {e}")
+
+
+def collect_login_events():
+    """
+    Опрашивает /events каждого включённого сервера и сохраняет в
+    login_events только события входа ("Login Successful, %1 from %2" —
+    см. TrassirClient.get_events()). Прямой запрос пользователя: лента
+    на странице сервера (/api/events/<id>) читает TRASSIR вживую и
+    ничего не хранит — размер/срок жизни буфера событий на самом
+    TRASSIR нигде не документирован, так что вход, случившийся пока
+    никто не смотрел на дашборд, мог быть потерян безвозвратно, как
+    только буфер провернётся. Эта функция даёт независимый от того,
+    открыт ли сейчас дашборд, локальный архив.
+
+    Намеренно отдельная функция со своим расписанием (см. scheduler()
+    ниже), а не часть collect() — ошибка здесь (сеть, TRASSIR не
+    ответил) не должна иметь ни малейшего шанса повлиять на health-
+    опрос/алерты/Telegram-Email, у которых свой, более частый цикл и
+    куда более высокая цена сбоя.
+    """
+    try:
+        conn = get_db()
+        servers = conn.execute("SELECT * FROM servers WHERE enabled = 1").fetchall()
+
+        for server in servers:
+            client = TrassirClient({
+                "ip": server["ip"],
+                "port": server["port"],
+                "ssl": bool(server["ssl"]),
+                "sdk_password": server["sdk_password"]
+            })
+
+            result = client.get_events(limit=100)
+            if not result.get("ok"):
+                continue
+
+            for ev in result.get("events", []):
+                if ev.get("type") != "Login Successful, %1 from %2":
+                    continue
+
+                raw_ts = ev.get("timestamp")
+                if not raw_ts:
+                    continue
+
+                try:
+                    # timestamp от TRASSIR — микросекунды, уже посчитанные
+                    # по часовому поясу, настроенному НА САМОМ СЕРВЕРЕ (см.
+                    # CLAUDE.md "Event feed timestamps were 3 hours ahead
+                    # of real time" и аналогичный фикс {timeZone:'UTC'} в
+                    # JS). utcfromtimestamp() здесь не означает "это UTC" —
+                    # означает "взять цифры как есть, не сдвигать их ещё
+                    # раз", та же логика, что и на фронтенде.
+                    event_dt = datetime.utcfromtimestamp(int(raw_ts) / 1_000_000)
+                    event_time_str = event_dt.strftime("%Y-%m-%d %H:%M:%S")
+                except (ValueError, OSError, OverflowError):
+                    continue
+
+                conn.execute("""
+                    INSERT OR IGNORE INTO login_events
+                        (server_id, raw_timestamp, event_time, username, ip_address)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (
+                    server["id"], str(raw_ts), event_time_str,
+                    ev.get("username", ""), ev.get("ip_address", "")
+                ))
+
+            conn.commit()
+
+        conn.close()
+    except Exception as e:
+        print(f"Ошибка сбора истории входов: {e}")
 
 
 def _telegram_ini_path():
@@ -2026,11 +2149,17 @@ def scheduler():
     schedule.every(interval).seconds.do(collect)
     schedule.every(1).hours.do(cleanup_old_data)
     schedule.every().day.at("03:15").do(backup_app_settings)
+    # Архив входов — отдельное, более редкое расписание (логины
+    # случаются не каждые 15 секунд, частый опрос collect() здесь не
+    # нужен), и намеренно отдельный вызов от collect() выше — см.
+    # docstring collect_login_events().
+    schedule.every(5).minutes.do(collect_login_events)
 
     # Первый сбор через 5 секунд после старта
     time.sleep(5)
     collect()
     cleanup_old_data()
+    collect_login_events()
 
     # Бесконечный цикл
     while True:
@@ -2250,7 +2379,8 @@ def server_detail(server_id):
         cur=dict(current) if current else None,
         alerts_active=[dict(a) for a in alerts_active],
         alerts_history=[dict(a) for a in alerts_history],
-        logged_in=is_logged_in()
+        logged_in=is_logged_in(),
+        login_events_retention_days=LOGIN_EVENTS_RETENTION_DAYS
     )
 
 
@@ -2469,6 +2599,35 @@ def api_events(server_id):
     if err:
         return err
     return jsonify(client.get_events())
+
+
+@app.route("/api/logins/<int:server_id>")
+def api_logins(server_id):
+    """
+    Локальный архив входов (login_events) — в отличие от /api/events
+    выше, читает НЕ TRASSIR вживую, а собственную БД, куда
+    collect_login_events() складывает события "Login Successful"
+    каждые 5 минут (см. её же docstring) и откуда их чистит
+    cleanup_old_data() по истечении LOGIN_EVENTS_RETENTION_DAYS.
+    Тот же login-гейт, что и у /api/events, /api/screenshot,
+    /api/channels — это тоже аудит-данные (кто и откуда логинился).
+    """
+    if not is_logged_in():
+        return jsonify({"ok": 0, "error": "Требуется авторизация"}), 403
+    conn = get_db()
+    server = conn.execute("SELECT id FROM servers WHERE id = ?", (server_id,)).fetchone()
+    if not server:
+        conn.close()
+        return jsonify({"ok": 0, "error": "Сервер не найден"}), 404
+    rows = conn.execute("""
+        SELECT event_time, username, ip_address
+        FROM login_events
+        WHERE server_id = ?
+        ORDER BY event_time DESC
+        LIMIT 200
+    """, (server_id,)).fetchall()
+    conn.close()
+    return jsonify({"ok": 1, "logins": [dict(r) for r in rows]})
 
 
 @app.route("/api/servers", methods=["GET", "POST", "PUT", "DELETE"])
@@ -3246,7 +3405,7 @@ def api_services_status():
 if __name__ != "__main__":
     # Вывод при запуске через gunicorn
     print("=" * 60)
-    print("  TRASSIR Monitor v13.5")
+    print("  TRASSIR Monitor v13.6")
     print("  Система мониторинга серверов TRASSIR")
     print("=" * 60)
 
@@ -4633,6 +4792,28 @@ cat > $INSTALL_DIR/templates/server.html << 'SERVEREOF'
         </div>
     </div>
 </div>
+
+<!-- История входов (архив) — отдельная от "Ленты событий" выше
+     карточка, прямой запрос пользователя: "Лента событий" читает
+     TRASSIR вживую и ничего не хранит, а размер/срок жизни буфера
+     событий на самом TRASSIR нигде не документирован — вход мог
+     потеряться безвозвратно, если никто не смотрел на дашборд в
+     момент, когда буфер провернулся. Эта карточка читает ЛОКАЛЬНУЮ
+     БД (/api/logins, см. collect_login_events()/login_events), а не
+     SDK — хранится до {{ login_events_retention_days }} дн. -->
+<div class="row g-3 mt-3">
+    <div class="col-md-6">
+        <div class="card">
+            <div class="card-header" style="cursor:pointer;" onclick="toggleLogins()">
+                <span><i class="bi bi-person-check"></i> История входов (архив, до {{ login_events_retention_days }} дн.)</span>
+                <i class="bi bi-chevron-down" id="loginsChevron"></i>
+            </div>
+            <div class="card-body" id="loginsBody" style="display:none; max-height:420px; overflow-y:auto;">
+                <div id="loginsFeed" style="color:var(--muted);">Нажмите на заголовок, чтобы загрузить</div>
+            </div>
+        </div>
+    </div>
+</div>
 {% endif %}
 
 {% endblock %}
@@ -4979,6 +5160,50 @@ function loadEvents() {
         })
         .catch(function() {
             feed.innerHTML = '<div style="color:var(--muted);">Ошибка загрузки событий</div>';
+        });
+}
+
+// ============================================
+// ИСТОРИЯ ВХОДОВ (ЛОКАЛЬНЫЙ АРХИВ, не живой SDK-запрос)
+// ============================================
+function toggleLogins() {
+    var body = document.getElementById('loginsBody');
+    var chevron = document.getElementById('loginsChevron');
+    var opening = body.style.display === 'none';
+    body.style.display = opening ? 'block' : 'none';
+    chevron.className = opening ? 'bi bi-chevron-up' : 'bi bi-chevron-down';
+    if (opening) {
+        loadLogins();
+    }
+}
+
+function loadLogins() {
+    var feed = document.getElementById('loginsFeed');
+    feed.innerHTML = '<div style="color:var(--muted);">Загрузка...</div>';
+    fetch('/api/logins/{{ server.id }}')
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
+            if (!data.ok) {
+                feed.innerHTML = '<div style="color:var(--muted);">' + escHtml(data.error || 'Ошибка') + '</div>';
+                return;
+            }
+            if (!data.logins || !data.logins.length) {
+                feed.innerHTML = '<div style="color:var(--muted);">Входов в архиве пока нет</div>';
+                return;
+            }
+            // event_time уже лежит в БД готовой строкой (та же логика, что и
+            // alert.ts в карточке "Алерты" выше на этой странице) — никакого
+            // JS Date() здесь не нужно, повторного сдвига часового пояса тоже.
+            feed.innerHTML = data.logins.map(function(row) {
+                return '<div style="padding:6px 0; border-bottom:1px solid rgba(255,255,255,0.05);">' +
+                    '<div>' + escHtml(row.username || '?') + '</div>' +
+                    '<small style="color:var(--muted);">' + escHtml(row.event_time || '') +
+                    (row.ip_address ? ' · ' + escHtml(row.ip_address) : '') +
+                    '</small></div>';
+            }).join('');
+        })
+        .catch(function() {
+            feed.innerHTML = '<div style="color:var(--muted);">Ошибка загрузки истории входов</div>';
         });
 }
 
@@ -6082,7 +6307,7 @@ echo ""
 # Gunicorn конфигурация
 echo "  • Создание конфигурации Gunicorn..."
 cat > $INSTALL_DIR/gunicorn_config.py << GUNEOF
-# Конфигурация Gunicorn для TRASSIR Monitor v13.5
+# Конфигурация Gunicorn для TRASSIR Monitor v13.6
 # Использует gevent для поддержки WebSocket (совместим с Python 3.12+/3.13)
 
 bind = "127.0.0.1:${APP_PORT}"
@@ -6101,7 +6326,7 @@ echo "    ✓ gunicorn_config.py создан"
 echo "  • Создание systemd сервиса..."
 cat > /etc/systemd/system/$SERVICE.service << SERVEOF
 [Unit]
-Description=TRASSIR Monitor v13.5
+Description=TRASSIR Monitor v13.6
 Documentation=https://github.com/trassir-monitor
 After=network-online.target
 Wants=network-online.target
@@ -6142,7 +6367,7 @@ echo "    ✓ nginx drop-in создан"
 # Nginx конфигурация
 echo "  • Создание конфигурации Nginx..."
 cat > /etc/nginx/sites-available/trassir-monitor << NGINXEOF
-# Nginx конфигурация для TRASSIR Monitor v13.5
+# Nginx конфигурация для TRASSIR Monitor v13.6
 server {
     listen $WEB_PORT default_server;
     listen [::]:$WEB_PORT default_server;
@@ -6583,9 +6808,9 @@ echo ""
 echo -e "${GREEN}╔══════════════════════════════════════════════╗${NC}"
 echo -e "${GREEN}║                                              ║${NC}"
 if [ "$IS_UPDATE" -eq 1 ]; then
-echo -e "${GREEN}║   TRASSIR Monitor v13.5 — ОБНОВЛЁН!          ║${NC}"
+echo -e "${GREEN}║   TRASSIR Monitor v13.6 — ОБНОВЛЁН!          ║${NC}"
 else
-echo -e "${GREEN}║   TRASSIR Monitor v13.5 — УСТАНОВЛЕН!        ║${NC}"
+echo -e "${GREEN}║   TRASSIR Monitor v13.6 — УСТАНОВЛЕН!        ║${NC}"
 fi
 echo -e "${GREEN}║                                              ║${NC}"
 echo -e "${GREEN}╚══════════════════════════════════════════════╝${NC}"

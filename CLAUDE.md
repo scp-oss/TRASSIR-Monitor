@@ -2714,6 +2714,80 @@ check before assuming this same fix still applies unmodified.
   the committed test asserts the fixed code produces the latter, not
   the former, so a future regression back to double-shifting fails loudly.
 
+## Local login-event archive — login_events table + collect_login_events() (2026-10-07, v13.6)
+
+Direct follow-up request: "Лента событий TRASSIR" (added earlier the
+same day) reads `/events` live from TRASSIR and stores nothing — the
+user correctly pointed out the consequence: TRASSIR's own event
+buffer is a fixed, undocumented size (see `TrassirClient.get_events()`'s
+own docstring), so a login that happened while nobody had the server
+page open could be gone forever once the buffer rotates. Asked for a
+separate, persisted archive of logins specifically, kept for 1-2 weeks.
+
+- **New table `login_events`** (`server_id`, `raw_timestamp`,
+  `event_time`, `username`, `ip_address`, `collected_at`) with
+  `UNIQUE (server_id, raw_timestamp)`. The unique constraint matters
+  because `/events` has no "only what's new since last poll" cursor
+  (confirmed — not in the SDK manual) — every poll re-fetches the
+  whole buffer, so the same login appears in several consecutive
+  polls; `raw_timestamp` (TRASSIR's own microsecond value) is the only
+  reliable natural key, not `(username, ip_address)` — the same person
+  can log in twice in a row from the same IP.
+- **`collect_login_events()`** (new, in `install-trassir-monitor.sh`)
+  polls every enabled server's `/events`, keeps only
+  `type == "Login Successful, %1 from %2"`, and `INSERT OR IGNORE`s
+  into `login_events`. Deliberately its own function on its OWN
+  schedule (`schedule.every(5).minutes`, separate from `collect()`'s
+  `poll_interval`) — same isolation principle as the screenshots/live-
+  events feed added earlier: a failure here (network, TRASSIR down)
+  can't touch health polling, alerts, or Telegram/Email, because it
+  shares no code path with any of them.
+- **Timezone**: stores `event_time` via
+  `datetime.utcfromtimestamp(raw_ts / 1_000_000)` — this does NOT mean
+  "treat it as UTC", it means "don't add Python's own local-timezone
+  shift on top of what TRASSIR already sent", the exact same principle
+  as the frontend's `{timeZone: 'UTC'}` fix in the entry right above
+  this one. Both sides now agree: the raw microsecond value already
+  IS the intended (Moscow-local, per this project's standing
+  convention) wall-clock reading — display it, don't re-derive it.
+- **Retention**: `LOGIN_EVENTS_RETENTION_DAYS = 14` (new constant,
+  matches the user's own "1-2 weeks" ask) — a fixed value, deliberately
+  NOT reusing the existing `retention_days` setting (that one governs
+  health/alerts graph history, a different kind of data with
+  potentially different retention needs) and not yet exposed as its
+  own settings-page field — can be added later if the fixed two weeks
+  turns out wrong for someone's actual usage. Pruned inside the
+  existing `cleanup_old_data()` (runs hourly already), independent of
+  whether the general `retention_days > 0` gate is even enabled.
+- **New `/api/logins/<id>`** route — reads `login_events` from the
+  local DB (last 200 rows, newest first), NOT a live TRASSIR call.
+  Login-gated, same reasoning as `/api/events`/`/api/screenshot`/
+  `/api/channels` (audit data — who logged in, from where — is more
+  sensitive than a CPU percentage).
+- **New "История входов (архив, до N дн.)" card** on `/server/<id>`,
+  a THIRD collapsed-by-default card below "Скриншоты камер"/"Лента
+  событий TRASSIR" — deliberately a separate card, not merged into the
+  live events feed, since it answers a different question ("what
+  logged in over the last two weeks, even if nobody was watching" vs.
+  "what's happening on this server right now"). `event_time` is
+  displayed as the plain DB string, no client-side `Date()` math at
+  all — same pattern this dashboard already uses for `alert.ts` in the
+  Alerts card, and the only way to avoid reopening the same
+  double-timezone-shift bug the live feed just had fixed.
+- Tested the same way as everything else added today: `collect_login_events()`
+  against a real temp SQLite DB with a mocked `requests.Session` — only
+  login-type events get stored, re-polling the same overlapping buffer
+  doesn't duplicate rows, a genuinely new login is added, a connection
+  error on one server doesn't crash the whole collection run, and the
+  stored `event_time` matches the no-double-shift timezone rule. The
+  new `loadLogins()`/`toggleLogins()` were extracted out of the real
+  heredoc (not retyped) and run under `jsdom`: correct endpoint,
+  expand/collapse behavior, an honest empty-state message, real rows
+  rendering correctly, malicious `username`/`ip_address` staying
+  escaped (same XSS discipline as the live feed), and both a backend
+  error and a network failure surfacing a real message instead of a
+  silently blank card.
+
 ## Publishing hygiene
 
 Public repo. Never commit real server hostnames/IPs, ISP/provider names,
