@@ -1,6 +1,6 @@
 #!/bin/bash
 # ============================================
-# TRASSIR Monitor v13.0
+# TRASSIR Monitor v13.1
 # Проверено на Debian 12 13
 # ============================================
 set -e
@@ -23,7 +23,7 @@ clear
 # Баннер
 echo -e "${GREEN}╔══════════════════════════════════════════════╗${NC}"
 echo -e "${GREEN}║                                              ║${NC}"
-echo -e "${GREEN}║   TRASSIR Monitor v13.0 — Final Complete     ║${NC}"
+echo -e "${GREEN}║   TRASSIR Monitor v13.1 — Final Complete     ║${NC}"
 echo -e "${GREEN}║   Имена каналов • Алерты • Live дашборд      ║${NC}"
 echo -e "${GREEN}║   Debian 12/13 • gevent • Python 3.12/3.13   ║${NC}"
 echo -e "${GREEN}║                                              ║${NC}"
@@ -480,7 +480,7 @@ echo ""
 cat > $INSTALL_DIR/app/app.py << 'APPEOF'
 #!/usr/bin/env python3
 """
-TRASSIR Monitor v13.0 — Основной файл приложения
+TRASSIR Monitor v13.1 — Основной файл приложения
 Полная версия с определением имён отключённых каналов
 
 Функции:
@@ -528,7 +528,7 @@ SECRET_KEY_PATH = os.path.join(BASE_DIR, "data", "secret_key.txt")
 # является настоящим бэкапом в текущем виде.
 APP_BACKUP_DIR = os.path.join(BASE_DIR, "data", "app_backups")
 APP_BACKUP_KEEP = 5
-APP_VERSION = "v13.0"
+APP_VERSION = "v13.1"
 
 # ============================================
 # ИНИЦИАЛИЗАЦИЯ FLASK
@@ -1190,6 +1190,99 @@ class TrassirClient:
 
             return {"ok": 1, "channels": channels_status, "channels_by_guid": channels_by_guid}
 
+        except Exception as e:
+            return {"ok": 0, "error": str(e)}
+
+    def list_channels(self):
+        """
+        Лёгкий список каналов (guid+имя) — один запрос к /objects/, без
+        дополнительного опроса состояния КАЖДОГО канала (в отличие от
+        get_channels_info(), которая делает ещё N запросов ради online/
+        offline). Нужен только для построения сетки скриншотов на
+        странице сервера — там online/offline не требуется, достаточно
+        знать, какие каналы есть.
+        """
+        try:
+            params = {"password": self.sdk} if self.sdk else {}
+            response = self.session.get(f"{self.url}/objects/", params=params, timeout=10)
+
+            if response.status_code != 200:
+                return {"ok": 0, "error": f"HTTP {response.status_code}"}
+
+            all_objects = json.loads(response.text)
+            channels = [
+                {"guid": obj.get("guid", ""), "name": obj.get("name", "Unknown")}
+                for obj in all_objects
+                if obj.get("class") == "Channel" and obj.get("guid")
+            ]
+            return {"ok": 1, "channels": channels}
+
+        except Exception as e:
+            return {"ok": 0, "error": str(e)}
+
+    def get_screenshot(self, channel_guid):
+        """
+        Скриншот канала — SDK-команда /screenshot/{guid} (см. "Request
+        a screenshot" в SDK-мануале). Возвращает сырые байты JPEG.
+
+        Отдельный, короче обычного, таймаут — это разовый интерактивный
+        запрос с открытой страницы сервера, не фоновый опрос: если одна
+        камера не отвечает, пользователь не должен ждать её 10 секунд,
+        остальные скриншоты на той же странице от неё не зависят (каждый
+        грузится своим отдельным запросом из браузера).
+        """
+        try:
+            params = {"password": self.sdk} if self.sdk else {}
+            response = self.session.get(
+                f"{self.url}/screenshot/{channel_guid}",
+                params=params,
+                timeout=8
+            )
+            content_type = response.headers.get("content-type", "")
+            if response.status_code == 200 and content_type.startswith("image/"):
+                return {"ok": 1, "data": response.content, "content_type": content_type}
+            return {"ok": 0, "error": f"HTTP {response.status_code}"}
+
+        except requests.exceptions.Timeout:
+            return {"ok": 0, "error": "Таймаут"}
+        except Exception as e:
+            return {"ok": 0, "error": str(e)}
+
+    def get_events(self, limit=30):
+        """
+        Последние события сервера — SDK-команда /events (см. "Request
+        for server events" в SDK-мануале): Motion Start/Stop, Smoke
+        Detected, Login Successful и т.п. Используется ТОЛЬКО для живой
+        ленты на странице сервера — ничего не пишет в БД, не создаёт
+        алертов и не трогает Telegram/Email-уведомления. Намеренно
+        отдельная, независимая от collect() и существующей логики
+        алертов фича — так проще дать гарантию, что она никак не может
+        повлиять на уже работающие алерты (CPU/диски/архив/камеры).
+
+        TRASSIR отдаёт /events как буфер последних событий — размер
+        буфера на сервере нигде не документирован, поэтому на нашей
+        стороне всегда отрезаем до `limit` самых новых перед отдачей в
+        браузер: и чтобы не раздувать страницу, и чтобы разбор большого
+        JSON не стал неожиданно медленным на сервере с активным трафиком
+        событий (много Motion Start/Stop).
+        """
+        try:
+            params = {"password": self.sdk} if self.sdk else {}
+            response = self.session.get(f"{self.url}/events", params=params, timeout=10)
+
+            if response.status_code != 200:
+                return {"ok": 0, "error": f"HTTP {response.status_code}"}
+
+            events = json.loads(response.text)
+            if not isinstance(events, list):
+                return {"ok": 0, "error": "Неожиданный формат ответа"}
+
+            events = events[-limit:]
+            events.reverse()  # новые сверху
+            return {"ok": 1, "events": events}
+
+        except requests.exceptions.Timeout:
+            return {"ok": 0, "error": "Таймаут"}
         except Exception as e:
             return {"ok": 0, "error": str(e)}
 
@@ -2278,6 +2371,78 @@ def api_history(server_id):
     return jsonify(_aggregate_history(rows))
 
 
+def _client_for_server(server_id):
+    """
+    Общий хелпер для скриншотов/событий — достаёт сервер из БД и
+    поднимает TrassirClient. Возвращает (client, None) при успехе или
+    (None, (response, status)) при ошибке — второй элемент можно сразу
+    отдать как return из вызывающего route.
+    """
+    conn = get_db()
+    server = conn.execute("SELECT * FROM servers WHERE id = ?", (server_id,)).fetchone()
+    conn.close()
+    if not server:
+        return None, (jsonify({"ok": 0, "error": "Сервер не найден"}), 404)
+    client = TrassirClient({
+        "ip": server["ip"],
+        "port": server["port"],
+        "ssl": bool(server["ssl"]),
+        "sdk_password": server["sdk_password"]
+    })
+    return client, None
+
+
+# Скриншоты и события — живая картинка/лог с камер и сервера TRASSIR,
+# заметно чувствительнее обычных метрик CPU/дисков/архива (реальное
+# видео помещения, а в событиях — IP/логины админов TRASSIR). Остальные
+# /api/* read-роуты в этом файле намеренно открыты без логина (весь
+# дашборд читаемый, см. is_logged_in() — логин нужен только для
+# действий), но для этих трёх делаем исключение и требуем логин.
+@app.route("/api/channels/<int:server_id>")
+def api_channels(server_id):
+    """Список каналов сервера — для построения сетки скриншотов на странице сервера."""
+    if not is_logged_in():
+        return jsonify({"ok": 0, "error": "Требуется авторизация"}), 403
+    client, err = _client_for_server(server_id)
+    if err:
+        return err
+    return jsonify(client.list_channels())
+
+
+@app.route("/api/screenshot/<int:server_id>/<channel_guid>")
+def api_screenshot(server_id, channel_guid):
+    """
+    Проксирует скриншот канала с TRASSIR — SDK-пароль сервера остаётся
+    на бэкенде и никогда не попадает в браузер, та же логика, по которой
+    sdk_password уже убирается из server_public в server_detail().
+    """
+    if not is_logged_in():
+        return "Требуется авторизация", 403
+    if not re.match(r'^[A-Za-z0-9_-]+$', channel_guid):
+        return "Некорректный GUID канала", 400
+    client, err = _client_for_server(server_id)
+    if err:
+        return "Сервер не найден", 404
+    result = client.get_screenshot(channel_guid)
+    if not result["ok"]:
+        return "", 502
+    resp = make_response(result["data"])
+    resp.headers["Content-Type"] = result["content_type"]
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+@app.route("/api/events/<int:server_id>")
+def api_events(server_id):
+    """Последние события TRASSIR (/events) — только для отображения, не трогает alerts/Telegram."""
+    if not is_logged_in():
+        return jsonify({"ok": 0, "error": "Требуется авторизация"}), 403
+    client, err = _client_for_server(server_id)
+    if err:
+        return err
+    return jsonify(client.get_events())
+
+
 @app.route("/api/servers", methods=["GET", "POST", "PUT", "DELETE"])
 def api_servers():
     conn = get_db()
@@ -3053,7 +3218,7 @@ def api_services_status():
 if __name__ != "__main__":
     # Вывод при запуске через gunicorn
     print("=" * 60)
-    print("  TRASSIR Monitor v13.0")
+    print("  TRASSIR Monitor v13.1")
     print("  Система мониторинга серверов TRASSIR")
     print("=" * 60)
 
@@ -4405,6 +4570,43 @@ cat > $INSTALL_DIR/templates/server.html << 'SERVEREOF'
     </div>
 </div>
 
+{% if logged_in %}
+<!-- Скриншоты камер и лента событий TRASSIR (SDK) — свёрнуты по
+     умолчанию, грузятся только по клику, чтобы не захламлять страницу
+     и не дёргать TRASSIR лишний раз на серверах, где это не нужно.
+     Полностью отдельная фича от health-опроса/алертов/Telegram —
+     ничего здесь не пишет в БД и не может их затронуть. -->
+<div class="row g-3 mt-1">
+    <div class="col-md-6">
+        <div class="card">
+            <div class="card-header" style="cursor:pointer;" onclick="toggleScreenshots()">
+                <span><i class="bi bi-camera"></i> Скриншоты камер</span>
+                <i class="bi bi-chevron-down" id="screenshotsChevron"></i>
+            </div>
+            <div class="card-body" id="screenshotsBody" style="display:none;">
+                <div id="screenshotsGrid" class="row g-2">
+                    <div class="col-12 text-center" style="color:var(--muted);">Нажмите на заголовок, чтобы загрузить</div>
+                </div>
+                <button class="btn btn-sm btn-outline-light mt-2" onclick="loadScreenshots()">
+                    <i class="bi bi-arrow-clockwise"></i> Обновить
+                </button>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-6">
+        <div class="card">
+            <div class="card-header" style="cursor:pointer;" onclick="toggleEvents()">
+                <span><i class="bi bi-list-ul"></i> Лента событий TRASSIR</span>
+                <i class="bi bi-chevron-down" id="eventsChevron"></i>
+            </div>
+            <div class="card-body" id="eventsBody" style="display:none; max-height:420px; overflow-y:auto;">
+                <div id="eventsFeed" style="color:var(--muted);">Нажмите на заголовок, чтобы загрузить</div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endif %}
+
 {% endblock %}
 
 {% block scripts %}
@@ -4561,6 +4763,125 @@ function dismissAlert(alertId) {
     fetch('/api/alerts/' + alertId + '/dismiss', { method: 'POST' })
         .then(function() {
             location.reload();
+        });
+}
+
+// ============================================
+// СКРИНШОТЫ КАМЕР И ЛЕНТА СОБЫТИЙ (SDK)
+// Полностью отдельная фича от health/алертов/Telegram — ошибка здесь
+// (сервер не ответил на /screenshot или /events) никак не может
+// повлиять на остальную страницу или на данные collect(), это просто
+// показывает "не загрузилось" в своём блоке.
+// ============================================
+var screenshotsLoaded = false;
+var eventsPollTimer = null;
+
+function escHtml(s) {
+    return String(s)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
+function toggleScreenshots() {
+    var body = document.getElementById('screenshotsBody');
+    var chevron = document.getElementById('screenshotsChevron');
+    var opening = body.style.display === 'none';
+    body.style.display = opening ? 'block' : 'none';
+    chevron.className = opening ? 'bi bi-chevron-up' : 'bi bi-chevron-down';
+    if (opening && !screenshotsLoaded) {
+        loadScreenshots();
+    }
+}
+
+function loadScreenshots() {
+    var grid = document.getElementById('screenshotsGrid');
+    grid.innerHTML = '<div class="col-12 text-center" style="color:var(--muted);">Загрузка...</div>';
+    fetch('/api/channels/{{ server.id }}')
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
+            screenshotsLoaded = true;
+            if (!data.ok || !data.channels || !data.channels.length) {
+                grid.innerHTML = '<div class="col-12 text-center" style="color:var(--muted);">' +
+                    escHtml(data.error || 'Каналы не найдены') + '</div>';
+                return;
+            }
+            grid.innerHTML = '';
+            data.channels.forEach(function(ch) {
+                var col = document.createElement('div');
+                col.className = 'col-6 col-lg-4';
+                var cacheBust = Date.now();
+                var imgUrl = '/api/screenshot/{{ server.id }}/' + encodeURIComponent(ch.guid) + '?t=' + cacheBust;
+                col.innerHTML =
+                    '<div class="text-center">' +
+                    '<img src="' + imgUrl + '" alt="' + escHtml(ch.name) + '" ' +
+                    'style="width:100%; border-radius:6px; background:#000; aspect-ratio:16/9; object-fit:cover;" ' +
+                    'loading="lazy" onerror="this.style.opacity=0.3;" />' +
+                    '<div><small style="color:var(--muted);">' + escHtml(ch.name) + '</small></div>' +
+                    '</div>';
+                grid.appendChild(col);
+            });
+        })
+        .catch(function() {
+            screenshotsLoaded = false;
+            grid.innerHTML = '<div class="col-12 text-center" style="color:var(--muted);">Ошибка загрузки списка каналов</div>';
+        });
+}
+
+function toggleEvents() {
+    var body = document.getElementById('eventsBody');
+    var chevron = document.getElementById('eventsChevron');
+    var opening = body.style.display === 'none';
+    body.style.display = opening ? 'block' : 'none';
+    chevron.className = opening ? 'bi bi-chevron-up' : 'bi bi-chevron-down';
+    if (opening) {
+        loadEvents();
+        // Опрос идёт только пока блок реально раскрыт на экране — сворачивание
+        // останавливает таймер, чтобы открытая, но не просматриваемая страница
+        // не продолжала фоново дёргать /events каждую минуту.
+        if (!eventsPollTimer) {
+            eventsPollTimer = setInterval(loadEvents, 60000);
+        }
+    } else if (eventsPollTimer) {
+        clearInterval(eventsPollTimer);
+        eventsPollTimer = null;
+    }
+}
+
+function loadEvents() {
+    var feed = document.getElementById('eventsFeed');
+    fetch('/api/events/{{ server.id }}')
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
+            if (!data.ok) {
+                feed.innerHTML = '<div style="color:var(--muted);">' + escHtml(data.error || 'Ошибка') + '</div>';
+                return;
+            }
+            if (!data.events || !data.events.length) {
+                feed.innerHTML = '<div style="color:var(--muted);">Событий пока нет</div>';
+                return;
+            }
+            feed.innerHTML = data.events.map(function(ev) {
+                var tsLabel = '';
+                if (ev.timestamp) {
+                    // timestamp от TRASSIR — в микросекундах (см. SDK-мануал), для JS Date нужны миллисекунды.
+                    var ms = parseInt(ev.timestamp, 10) / 1000;
+                    if (!isNaN(ms)) { tsLabel = new Date(ms).toLocaleString('ru-RU'); }
+                }
+                var extra = [];
+                if (ev.username) { extra.push(escHtml(ev.username)); }
+                if (ev.ip_address) { extra.push(escHtml(ev.ip_address)); }
+                var extraStr = extra.length ? ' · ' + extra.join(' · ') : '';
+                return '<div style="padding:6px 0; border-bottom:1px solid rgba(255,255,255,0.05);">' +
+                    '<div>' + escHtml(ev.type || 'Событие') + '</div>' +
+                    '<small style="color:var(--muted);">' + escHtml(tsLabel) + extraStr + '</small>' +
+                    '</div>';
+            }).join('');
+        })
+        .catch(function() {
+            feed.innerHTML = '<div style="color:var(--muted);">Ошибка загрузки событий</div>';
         });
 }
 
@@ -5655,7 +5976,7 @@ echo ""
 # Gunicorn конфигурация
 echo "  • Создание конфигурации Gunicorn..."
 cat > $INSTALL_DIR/gunicorn_config.py << GUNEOF
-# Конфигурация Gunicorn для TRASSIR Monitor v13.0
+# Конфигурация Gunicorn для TRASSIR Monitor v13.1
 # Использует gevent для поддержки WebSocket (совместим с Python 3.12+/3.13)
 
 bind = "127.0.0.1:${APP_PORT}"
@@ -5674,7 +5995,7 @@ echo "    ✓ gunicorn_config.py создан"
 echo "  • Создание systemd сервиса..."
 cat > /etc/systemd/system/$SERVICE.service << SERVEOF
 [Unit]
-Description=TRASSIR Monitor v13.0
+Description=TRASSIR Monitor v13.1
 Documentation=https://github.com/trassir-monitor
 After=network-online.target
 Wants=network-online.target
@@ -5715,7 +6036,7 @@ echo "    ✓ nginx drop-in создан"
 # Nginx конфигурация
 echo "  • Создание конфигурации Nginx..."
 cat > /etc/nginx/sites-available/trassir-monitor << NGINXEOF
-# Nginx конфигурация для TRASSIR Monitor v13.0
+# Nginx конфигурация для TRASSIR Monitor v13.1
 server {
     listen $WEB_PORT default_server;
     listen [::]:$WEB_PORT default_server;
@@ -6156,9 +6477,9 @@ echo ""
 echo -e "${GREEN}╔══════════════════════════════════════════════╗${NC}"
 echo -e "${GREEN}║                                              ║${NC}"
 if [ "$IS_UPDATE" -eq 1 ]; then
-echo -e "${GREEN}║   TRASSIR Monitor v13.0 — ОБНОВЛЁН!          ║${NC}"
+echo -e "${GREEN}║   TRASSIR Monitor v13.1 — ОБНОВЛЁН!          ║${NC}"
 else
-echo -e "${GREEN}║   TRASSIR Monitor v13.0 — УСТАНОВЛЕН!        ║${NC}"
+echo -e "${GREEN}║   TRASSIR Monitor v13.1 — УСТАНОВЛЕН!        ║${NC}"
 fi
 echo -e "${GREEN}║                                              ║${NC}"
 echo -e "${GREEN}╚══════════════════════════════════════════════╝${NC}"

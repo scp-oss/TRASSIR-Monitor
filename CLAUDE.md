@@ -2404,6 +2404,76 @@ earlier version — harmless, unreferenced by any code from this point
 forward, deliberately left alone rather than adding cleanup machinery
 for an empty-ish table.
 
+## Camera screenshots + live TRASSIR event feed on the server page (2026-10-07)
+
+Direct follow-up to the SDK-backup removal above: once the official
+142-page manual had been fully read (not guessed at — see the
+`save_configuration`/`cloudbackup_*` research above for why that
+distinction mattered this same session), two more SDK commands turned
+out to be genuinely real, simple, single-GET, and NOT vendor-restricted
+the way settings-backup was — `/screenshot/{guid}` ("Request a
+screenshot") and `/events` ("Request for server events"). Both use the
+exact same `password=` auth this project's `TrassirClient.get()`
+already uses — no session/`sid=` flow needed.
+
+- **`TrassirClient.list_channels()`/`get_screenshot()`/`get_events()`**
+  (new methods, same class) — `list_channels()` is a cheap one-request
+  version of `get_channels_info()`'s channel enumeration (just
+  guid+name, no per-channel online check — that part isn't needed here
+  and doing it would mean N extra requests for nothing).
+  `get_screenshot(guid)` returns raw JPEG bytes. `get_events(limit=30)`
+  calls `/events` and returns only the newest `limit` entries,
+  newest-first — TRASSIR doesn't document how large its own event
+  buffer is, so trimming on our side is what keeps both the page and
+  the JSON parse bounded regardless of how chatty a server's Motion
+  Start/Stop traffic is.
+- **Deliberately NOT wired into `collect()`, `alerts`, or Telegram/Email
+  at all.** This was the explicit constraint going in ("не сломает наш
+  преет и наши алерты которые сейчас есть") — the three new routes
+  (`/api/channels/<id>`, `/api/screenshot/<id>/<guid>`,
+  `/api/events/<id>`) are only ever called on-demand from JS on the
+  server detail page, never from the health-polling loop. A failure
+  fetching a screenshot or the event feed can't touch health history,
+  alert auto-close logic, or anything the notifier reads — they don't
+  share a code path with any of it. If native events (e.g. `Smoke
+  Detected`, `Login Successful`) are ever wanted as real Telegram
+  alerts later, that needs its own deliberate design pass (own dedup
+  table, own message formatting) — not a quiet side effect of this one.
+- **Screen footprint**: both features live in two new cards on
+  `/server/<id>`, below the existing chart+alerts row, **collapsed by
+  default** — nothing fetches or renders until the user clicks the
+  card header ("не сильно загромоздит экран" was explicit). Opening the
+  events card starts a 60s poll that's cancelled the moment the card is
+  collapsed again, so a page left open in a background tab doesn't
+  keep hitting `/events` forever.
+- **Login-gated, unlike most other `/api/*` read routes in this file.**
+  The rest of the dashboard (health, history, alerts) is readable
+  without logging in — `is_logged_in()` only gates write actions. Made
+  an explicit exception here: camera screenshots are real interior
+  video, and `/events` surfaces `username`/`ip_address` for every
+  TRASSIR admin login — both are a materially more sensitive class of
+  data than a CPU percentage, so all three new routes 403 for anonymous
+  requests, and the template only renders the two cards at all
+  `{% if logged_in %}` (verified: the actual `<div id="screenshotsGrid">`
+  element is absent from the anonymous-rendered page, not just
+  visually hidden).
+- `channel_guid` in `/api/screenshot/<id>/<guid>` is validated against
+  `^[A-Za-z0-9_-]+$` before being concatenated into the outbound TRASSIR
+  URL — real GUIDs from the manual's own examples (`XjwUsj8w`, `bN8mjs2L`)
+  all match; a path-traversal-shaped value (`../../etc/passwd`) does
+  not. Defense in depth, not a response to an observed exploit.
+- Tested the same way as the XSS fix earlier in this file: extracted the
+  real `escHtml`/`loadScreenshots`/`loadEvents` functions out of the
+  heredoc (not retyped) and ran them under `jsdom` against a mocked
+  `fetch` returning deliberately malicious channel names and event
+  fields (`<img src=x onerror=...>`, `<script>...`, an `ip_address`
+  with an embedded `<svg onload=...>`) — confirms no live `<script>`/
+  `onerror`/`onload` ever lands in the DOM, only escaped text. Also
+  unit-tested `TrassirClient.list_channels()`/`get_screenshot()`/
+  `get_events()` against mocked `requests` responses (HTTP errors,
+  timeouts, a 200 response with a non-image content-type, a malformed
+  non-list `/events` body, and the limit/ordering behavior) — all pass.
+
 ## Publishing hygiene
 
 Public repo. Never commit real server hostnames/IPs, ISP/provider names,
